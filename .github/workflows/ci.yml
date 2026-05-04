@@ -38,8 +38,12 @@ jobs:
   # a manual + reviewed step), but it does prove our output matches the
   # committed reference on the platform that produced it.
   macos:
-    name: macOS (stable)
-    runs-on: macos-latest
+    name: macOS (15, pinned)
+    # Pin to a specific macOS image so the bundled `coremlc` (Xcode toolchain)
+    # version is reproducible. `macos-latest` rolls forward and would otherwise
+    # change Apple's `buildInfo` string and any other future cosmetic output
+    # without notice. See the sanity-check step below for what we tolerate.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,9 +60,18 @@ jobs:
       - run: cargo build --release --all-targets
       - run: cargo test --release
       - name: Round-trip fixtures via coremlc (regression sanity check)
-        # On macOS only, additionally regenerate each expected-macos.mlmodelc
-        # from the committed input.mlmodel and check it matches the committed
-        # reference. Catches the case where the toolchain itself drifts.
+        # Re-run `xcrun coremlc compile` against each committed input and
+        # diff against the committed reference, ignoring lines that
+        # legitimately change between Apple toolchain releases:
+        #
+        #   - `[buildInfo = ...]` in `model.mil` carries the producer's
+        #     `coremlc-component-MIL` and `coremlc-version` strings. They
+        #     bump with every Xcode update and don't materially affect what
+        #     watchOS does at load time (the loader is what we care about,
+        #     not the producer identification).
+        #
+        # If anything else drifts, that's a real signal — the fixture or
+        # this script needs updating, and a warning is the right response.
         run: |
           set -e
           for fx in tests/fixtures/*/; do
@@ -66,10 +79,16 @@ jobs:
             [ -f "$input" ] || continue
             tmp=$(mktemp -d)
             xcrun coremlc compile "$input" "$tmp"
-            # coremlc names the output after the input filename stem.
             stem=$(basename "$input" .mlmodel)
-            diff -r "${fx}expected-macos.mlmodelc/model.mil" "$tmp/${stem}.mlmodelc/model.mil" || {
-                echo "::warning::expected-macos.mlmodelc/model.mil drifted from current coremlc output for $fx"
-            }
+            committed="${fx}expected-macos.mlmodelc/model.mil"
+            regenerated="$tmp/${stem}.mlmodelc/model.mil"
+            # Strip the buildInfo line from both before diffing.
+            stripped_committed=$(grep -v '^\[buildInfo' "$committed")
+            stripped_regenerated=$(grep -v '^\[buildInfo' "$regenerated")
+            if [ "$stripped_committed" != "$stripped_regenerated" ]; then
+              echo "::warning::expected-macos.mlmodelc/model.mil drifted from current coremlc output for $fx (ignoring buildInfo)"
+              diff <(printf '%s\n' "$stripped_committed") \
+                   <(printf '%s\n' "$stripped_regenerated") || true
+            fi
             rm -rf "$tmp"
           done
