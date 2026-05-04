@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Linux build verifies the crate is platform-portable. The fixture-compare
+  # harness runs everywhere — the inputs are pre-captured from `coremlc` on
+  # macOS, but our compiler is pure-Rust data transformation, so the round-
+  # trip works on any OS.
+  linux:
+    name: Linux (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release --all-targets
+      - run: cargo test --release
+
+  # macOS build is the regression gate. Anyone bumping the crate or the
+  # fixtures would re-run `xcrun coremlc compile` here as the source of truth
+  # for `expected-macos.mlmodelc/`. CI doesn't regenerate fixtures (that's
+  # a manual + reviewed step), but it does prove our output matches the
+  # committed reference on the platform that produced it.
+  macos:
+    name: macOS (stable)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Sanity-check coremlc availability
+        run: xcrun --find coremlc
+      - run: cargo build --release --all-targets
+      - run: cargo test --release
+      - name: Round-trip fixtures via coremlc (regression sanity check)
+        # On macOS only, additionally regenerate each expected-macos.mlmodelc
+        # from the committed input.mlmodel and check it matches the committed
+        # reference. Catches the case where the toolchain itself drifts.
+        run: |
+          set -e
+          for fx in tests/fixtures/*/; do
+            input="${fx}input.mlmodel"
+            [ -f "$input" ] || continue
+            tmp=$(mktemp -d)
+            xcrun coremlc compile "$input" "$tmp"
+            # coremlc names the output after the input filename stem.
+            stem=$(basename "$input" .mlmodel)
+            diff -r "${fx}expected-macos.mlmodelc/model.mil" "$tmp/${stem}.mlmodelc/model.mil" || {
+                echo "::warning::expected-macos.mlmodelc/model.mil drifted from current coremlc output for $fx"
+            }
+            rm -rf "$tmp"
+          done
