@@ -77,17 +77,31 @@ mlmodelc-export model.mlmodel ./model.mlmodelc
 Useful for CI / build pipelines where you want a runnable bundle without
 depending on a macOS host with Xcode installed.
 
-## Provenance
+## On-device Validation
 
 This crate originated as a Swift package (`MILTextCompiler`) inside the
-`metal-info-app` watchOS validation harness for [rustnn]. After validating
-the approach end-to-end on Apple Watch SE 2 hardware (arm64_32, watchOS 11)
-running real WebNN workloads — LeNet MNIST, char-level transformer, MNIST
-autoencoder, 44/44 WPT operator coverage — we ported it to Rust to align
-with rustnn's Rust-first architecture.
-
-The full motivation is documented in
+`metal-info-app` watchOS validation harness for [rustnn]. We ported it to
+Rust to align with rustnn's Rust-first architecture and so the crate could
+be reused outside that harness. The full motivation is documented in
 [rustnn/rustnn#110](https://github.com/rustnn/rustnn/issues/110).
+
+When paired with **rustnn**'s WebNN-graph → CoreML MLProgram frontend, the
+combination has been validated end-to-end on real **Apple Watch SE 2
+hardware** (arm64_32, watchOS 11, ~150 MB jetsam ceiling) — a device
+where Apple ships *no* CoreML model compiler at all. Every model below is
+compiled at runtime on the watch itself, then loaded with
+`MLModel(contentsOf:)` and exercised with real inputs:
+
+| Workload | rustnn frontend output | Result on Watch SE 2 |
+|---|---|---|
+| **W3C WebNN WPT operator coverage** | per-op MLProgram fixtures | **44/44 ops pass** (100%) — abs, add, ceil, clamp, concat, conv2d, conv_transpose2d, div, elu, exp, expand, floor, hard_sigmoid, hard_swish, instance_normalization, leaky_relu, linear, log, matmul, max, min, mul, neg, pow, reduce_l1/l2/log_sum/log_sum_exp/max/mean/min/product/sum/sum_square, relu, reshape, sigmoid, slice, softmax, split, sqrt, sub, tanh, transpose |
+| **LeNet MNIST classifier** | `conv2d → relu → averagePool2d → … → softmax` | **10/10 correct** at p ≥ 0.92 (compile 12 ms, load 305 ms, predict 29 ms total) |
+| **Char-level transformer (Shakespeare)** | `layerNorm → matmul → gelu → matmul → softmax` | **5/5 top-3 hits** vs host reference (compile 12 ms, load 363 ms, predict 43 ms) |
+| **MNIST autoencoder decoder** | latent → fully-connected → conv stack → output | **10/10 reconstructions, mean MSE 0.000000** vs host reference |
+
+Peak resident memory across all four workloads stayed under **10 MB** — well
+below the arm64_32 jetsam ceiling that originally motivated the streaming
+emission path and the alloc-free hex-float byte formatter described below.
 
 [rustnn]: https://github.com/rustnn/rustnn
 
