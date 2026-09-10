@@ -1,0 +1,77 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "outputSchema" : [
+      {
+        "dataType" : "Float32",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "0...2 × 0...4 × 2",
+        "shapeRange" : "[[0, 2], [0, 4], [2, 2]]",
+        "formattedType" : "MultiArray (Float32 2 × 4 × 2)",
+        "type" : "MultiArray",
+        "shape" : "[2, 4, 2]",
+        "name" : "output",
+        "shortDescription" : ""
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 9,
+    "mlProgramOperationTypeHistogram" : {
+      "Ios17.gather" : 1,
+      "Ios17.cast" : 2,
+      "Ios17.less" : 1,
+      "Ios17.mul" : 1,
+      "Ios17.maximum" : 1,
+      "Ios17.add" : 1,
+      "Ios17.minimum" : 1
+    },
+    "computePrecision" : "Mixed (Float32, Int32)",
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "15.0",
+      "tvOS" : "18.0",
+      "visionOS" : "2.0",
+      "watchOS" : "11.0",
+      "iOS" : "18.0",
+      "macCatalyst" : "18.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "userDefinedMetadata" : {
+
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 3 × 2)",
+        "shortDescription" : "",
+        "shape" : "[3, 2]",
+        "name" : "data",
+        "type" : "MultiArray"
+      },
+      {
+        "dataType" : "Int32",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "0...2 × 0...4",
+        "shapeRange" : "[[0, 2], [0, 4]]",
+        "formattedType" : "MultiArray (Int32 2 × 4)",
+        "type" : "MultiArray",
+        "shape" : "[2, 4]",
+        "name" : "indices",
+        "shortDescription" : ""
+      }
+    ],
+    "generatedClassName" : "input",
+    "method" : "predict"
+  }
+]

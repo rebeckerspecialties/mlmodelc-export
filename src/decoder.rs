@@ -4,6 +4,7 @@
 //! message graph needed to reconstruct the MIL text and the function metadata
 //! that goes into `coremldata.bin` / `metadata.json`.
 
+use crate::description::{ModelDescription, ShapeFlexibility};
 use crate::pb_reader::{PBReader, read_packed_floats, read_packed_signed_varints};
 use crate::types::*;
 
@@ -49,6 +50,18 @@ pub fn decode(data: &[u8]) -> Result<MILProgram, MILDecoderError> {
 
     let program_data = program_data.ok_or(MILDecoderError::MissingProgram)?;
     let functions = decode_program(&program_data)?;
+    let description = ModelDescription::decode(&description_data);
+    for function in std::iter::once(&description.main).chain(&description.functions) {
+        if function
+            .inputs
+            .iter()
+            .any(|feature| matches!(feature.flexibility, Some(ShapeFlexibility::Enumerated(_))))
+        {
+            return Err(MILDecoderError::UnsupportedFormat(
+                "enumerated input shapes; only ranged flexibility is supported".into(),
+            ));
+        }
+    }
     Ok(MILProgram {
         version: 1,
         functions,
@@ -207,6 +220,11 @@ fn decode_value(data: &[u8]) -> Result<MILValue, MILDecoderError> {
         }
     }
 
+    if r#type.concrete_shape().is_none() {
+        return Err(MILDecoderError::UnsupportedFormat(
+            "immediate/blob values must have concrete dimensions".into(),
+        ));
+    }
     Ok(MILValue {
         r#type,
         tensor,
@@ -351,40 +369,75 @@ fn decode_value_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
 fn decode_tensor_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
     let mut reader = PBReader::new(data);
     let mut data_type_raw: u64 = 11; // default Float32
-    let mut shape: Vec<usize> = Vec::new();
+    let mut shape = Vec::new();
     while let Some((field, wire)) = reader.read_tag() {
         match field {
             1 => data_type_raw = reader.read_varint(),
             2 => {
-                let _ = reader.read_varint();
+                let rank = reader.read_varint() as i64;
+                if rank < 0 {
+                    return Err(MILDecoderError::UnsupportedFormat(
+                        "variable-rank tensors".into(),
+                    ));
+                }
             }
-            3 => shape.push(decode_dimension(reader.read_length_delimited())),
+            3 => shape.push(decode_dimension(reader.read_length_delimited())?),
             _ => reader.skip(wire),
         }
     }
     let data_type = MILDataType::from_raw(data_type_raw)
         .ok_or(MILDecoderError::UnknownDataType(data_type_raw))?;
-    Ok(MILType::new(data_type, shape))
+    Ok(MILType::with_dimensions(data_type, shape))
 }
 
-fn decode_dimension(data: &[u8]) -> usize {
+fn decode_dimension(data: &[u8]) -> Result<MILDimension, MILDecoderError> {
     let mut reader = PBReader::new(data);
+    let mut dimension = None;
     while let Some((field, wire)) = reader.read_tag() {
         match field {
             1 => {
                 let const_dim = reader.read_length_delimited();
                 let mut sub = PBReader::new(const_dim);
+                let mut size = 0;
                 while let Some((sub_field, sub_wire)) = sub.read_tag() {
                     match sub_field {
-                        1 => return sub.read_varint() as usize,
+                        1 => {
+                            size = usize::try_from(sub.read_varint()).map_err(|_| {
+                                MILDecoderError::UnsupportedFormat(
+                                    "dimension exceeds platform size".into(),
+                                )
+                            })?
+                        }
                         _ => sub.skip(sub_wire),
                     }
                 }
+                dimension = Some(MILDimension::Constant(size));
+            }
+            2 => {
+                let mut sub = PBReader::new(reader.read_length_delimited());
+                let mut variadic = false;
+                while let Some((field, wire)) = sub.read_tag() {
+                    if field == 1 {
+                        variadic = sub.read_varint() != 0;
+                    } else {
+                        sub.skip(wire);
+                    }
+                }
+                if variadic {
+                    return Err(MILDecoderError::UnsupportedFormat(
+                        "variadic dimensions".into(),
+                    ));
+                }
+                dimension = Some(MILDimension::Unknown);
             }
             _ => reader.skip(wire),
         }
     }
-    0
+    dimension.ok_or_else(|| {
+        MILDecoderError::UnsupportedFormat(
+            "dimension has neither constant nor unknown extent".into(),
+        )
+    })
 }
 
 fn decode_named_value_type(data: &[u8]) -> Result<MILNamedType, MILDecoderError> {
@@ -415,4 +468,55 @@ fn decode_map_entry(data: &[u8]) -> Result<(String, Vec<u8>), MILDecoderError> {
         }
     }
     Ok((key, value))
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_extent_is_not_constant_zero() {
+        assert_eq!(decode_dimension(&[0x12, 0]).unwrap(), MILDimension::Unknown);
+        assert_eq!(
+            decode_dimension(&[0x0a, 0]).unwrap(),
+            MILDimension::Constant(0)
+        );
+        assert_eq!(
+            decode_dimension(&[0x0a, 2, 8, 4]).unwrap(),
+            MILDimension::Constant(4)
+        );
+        let ty = MILType::with_dimensions(
+            MILDataType::Float32,
+            vec![MILDimension::Constant(0), MILDimension::Unknown],
+        );
+        assert_eq!(ty.text_representation(), "tensor<fp32, [0, ?]>");
+        assert_eq!(ty.concrete_shape(), None);
+        assert_eq!(
+            MILType::new(MILDataType::Float32, vec![0]).concrete_shape(),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn unsupported_dimensions_are_not_silently_zero() {
+        assert!(decode_dimension(&[]).is_err());
+        assert!(decode_dimension(&[0x12, 2, 8, 1]).is_err());
+        // TensorType.rank = -1.
+        assert!(
+            decode_tensor_type(&[
+                0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn values_require_concrete_dimensions() {
+        // Value.type.tensorType = { dataType: FLOAT32, rank: 1, dimensions: unknown }.
+        let ty = [0x12, 10, 0x0a, 8, 8, 11, 16, 1, 26, 2, 18, 0];
+        assert!(decode_value(&ty).is_err());
+        let mut blob = ty.to_vec();
+        blob.extend_from_slice(&[0x2a, 0]);
+        assert!(decode_value(&blob).is_err());
+    }
 }

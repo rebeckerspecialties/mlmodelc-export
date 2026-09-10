@@ -12,6 +12,7 @@
 //!   no enclosing brackets or parens — Apple's loader rejects both `(...)`
 //!   and `[...]` LHS forms.
 
+use crate::description::{FunctionDescription, ModelDescription, ShapeFlexibility, shape_text};
 use crate::hex_float::{hex_float16, hex_float32, hex_float32_bytes};
 use crate::sink::MILOutputSink;
 use crate::types::*;
@@ -32,14 +33,20 @@ pub fn emit(program: &MILProgram, out: &mut MILOutputSink) {
     out.write_str("})]\n");
     out.write_str("{\n");
 
+    let description = ModelDescription::decode(&program.description_data);
     for (name, function) in &program.functions {
-        emit_function(name, function, out);
+        emit_function(name, function, description.function(name), out);
     }
 
     out.write_str("}");
 }
 
-fn emit_function(name: &str, function: &MILFunction, out: &mut MILOutputSink) {
+fn emit_function(
+    name: &str,
+    function: &MILFunction,
+    description: Option<&FunctionDescription>,
+    out: &mut MILOutputSink,
+) {
     let tag = opset_tag(&function.opset);
     out.write_str(&format!("    func {name}<{tag}>("));
 
@@ -54,7 +61,11 @@ fn emit_function(name: &str, function: &MILFunction, out: &mut MILOutputSink) {
         ));
     }
 
-    out.write_str(") {\n");
+    out.write_str(")");
+    if let Some(description) = description {
+        emit_flexible_shapes(description, out);
+    }
+    out.write_str(" {\n");
 
     for op in &function.block.operations {
         emit_operation(op, out);
@@ -62,6 +73,47 @@ fn emit_function(name: &str, function: &MILFunction, out: &mut MILOutputSink) {
 
     let outs = function.block.outputs.join(", ");
     out.write_str(&format!("        }} -> ({outs});\n"));
+}
+
+fn emit_flexible_shapes(description: &FunctionDescription, out: &mut MILOutputSink) {
+    let mut features: Vec<_> = description
+        .inputs
+        .iter()
+        .filter(|feature| matches!(feature.flexibility, Some(ShapeFlexibility::Ranges(_))))
+        .collect();
+    features.sort_by(|a, b| a.name.cmp(&b.name));
+    if features.is_empty() {
+        return;
+    }
+    let defaults = features
+        .iter()
+        .map(|feature| {
+            format!(
+                "{{\"{}\", {}}}",
+                feature.name,
+                shape_text(&feature.default_shape())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let entries = features
+        .iter()
+        .filter_map(|feature| {
+            let Some(ShapeFlexibility::Ranges(ranges)) = &feature.flexibility else {
+                return None;
+            };
+            let ranges = ranges
+                .iter()
+                .map(|(lo, hi)| format!("[{lo}, {hi}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{{\"{}\", [{ranges}]}}", feature.name))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.write_str(&format!(
+        " [FlexibleShapeInformation = tuple<tuple<string, dict<string, tensor<int32, [?]>>>, tuple<string, dict<string, list<tensor<int32, [2]>, ?>>>>(((\"DefaultShapes\", {{{defaults}}}), (\"RangeDims\", {{{entries}}})))]"
+    ));
 }
 
 fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
@@ -174,7 +226,12 @@ fn emit_typed_literal(value: &MILValue, out: &mut MILOutputSink) {
         emit_scalar_literal(value, out);
     } else {
         out.write_str(&format!("{}(", value.r#type.text_representation()));
-        emit_nested_tensor_values(value, &value.r#type.shape, out);
+        // The decoder rejects dynamic immediate values; MIL values are concrete.
+        let shape = value
+            .r#type
+            .concrete_shape()
+            .expect("immediate tensor shape must be concrete");
+        emit_nested_tensor_values(value, &shape, out);
         out.write_str(")");
     }
 }

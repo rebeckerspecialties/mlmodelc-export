@@ -33,10 +33,10 @@ example.mlmodelc/
    └─ weights.bin            optional, when the input has external weights
 ```
 
-The output is byte-identical to `coremlc`'s for the canonical files
-(`model.mil`, `coremldata.bin`) and key-equivalent for `metadata.json` —
-verified per-commit by [`tests/golden.rs`](tests/golden.rs) against fixtures
-captured from `xcrun coremlc compile`.
+Golden tests compare `model.mil` (except build info) and `coremldata.bin`
+byte-for-byte against captured `coremlc` output. `metadata.json` is compared
+structurally, excluding generated class names and optimization statistics.
+The exporter reports source operations, not Apple's optimized executable.
 
 ## Quick start
 
@@ -130,8 +130,31 @@ on adding new fixtures.
 verified against `xcrun coremlc compile` (Xcode 26.4, `coremlc` 3520.4.1):
 
 - `model.mil` byte-identical except for the `buildInfo` producer string
-- `coremldata.bin` byte-identical (FunctionDescription + defaultFunctionName)
-- `metadata.json` semantically equivalent (key-order tolerant)
+- `coremldata.bin` byte-identical (source ModelDescription and per-function trailers)
+- `metadata.json` I/O schemas, shape constraints and function selection match
+
+Ranged flexible shapes preserve unknown MIL extents as `?`, together with the
+source default shapes and bounds. Literal zero remains a fixed empty extent;
+this does not imply that every CoreML operation can predict with empty tensors.
+Both single-function and multi-function descriptions are retained, including a
+non-first default function and descriptions larger than 255 bytes. Additional
+reference fixtures were captured with coremlc 3520.5.1 and 3600.25.1 (Xcode 27).
+
+Enumerated input shapes, variable-rank tensors and variadic dimensions currently
+return an explicit unsupported-format error instead of emitting an invalid model.
+For callers constructing intermediate types directly, `MILType.shape` now holds
+`MILDimension::{Constant, Unknown}`; `MILType::new` still accepts `Vec<usize>`.
+
+On macOS 15+, exercise exact numerical results while growing and shrinking
+inputs, including the selected default function:
+
+```sh
+cargo build --release
+swift tests/runtime_shapes.swift target/release/mlmodelc-export tests/fixtures
+```
+
+This compiles the checked-in protobufs through the Rust exporter before loading
+them with CoreML. It does not load the precompiled golden references.
 
 For large dense Float32 constants (>10⁵ elements) the streaming path uses an
 allocation-free hex-float byte formatter (see

@@ -50,8 +50,30 @@ Then re-run `cargo test` — the harness auto-discovers the new directory.
 ## Why both fixtures matter
 
 - **`expected-macos.mlmodelc/`** is the positive contract: our output should be
-  byte-identical to what Apple's official tool produces (modulo the
-  build-info string identifying the producer).
+  byte-identical for MIL and the model-description container (modulo build info).
+  JSON is compared structurally, excluding generated class names and optimization
+  statistics; feature schemas and function selection must match.
 - **`observed-watchos-broken.mlmodelc/`** documents the exact failure mode the
   crate exists to avoid. If our compiler ever degrades to producing that
   pattern, the negative-side test fails.
+
+## Flexible-shape regressions
+
+- `flexible-range`: rank-one ReLU with an unknown MIL extent, default 4 and
+  range [0, 4].
+- `flexible-gather`: dynamic rank-two indices with int32 feature type and
+  negative-index normalization before gather. Both fixtures originate from the
+  RustNN CoreML shape diagnostics; references use coremlc 3520.5.1 (MIL 3520.4.1).
+- `flexible-multifunction`: two ReLU functions with different default input
+  shapes, the second selected by default, and a description exceeding 255 bytes.
+  Reference captured with Xcode 27.0 (27A266a), coremlc 3600.25.1.
+
+`generate_flexible.py` derives the multi-function fixture and an unsupported
+enumerated-shape fixture from `flexible-range`. It uses `Model_pb2` generated
+from [Apple's Core ML format schemas](https://github.com/apple/coremltools/tree/main/mlmodel/format).
+`tests/unsupported/flexible-enumerated` retains native output for a future
+implementation; the current test requires an explicit unsupported-format error.
+
+`tests/runtime_shapes.swift` additionally checks 20 exact predictions, including
+1 -> 2 -> 4 -> 1 input changes on each loaded model and default/named function
+selection. Run it as documented in the repository README.
