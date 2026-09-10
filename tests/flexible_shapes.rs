@@ -21,7 +21,7 @@ fn preserves_large_description_and_per_function_trailers() {
         &[0xa2, 6, 0]
     );
     assert_eq!(binary.len(), 83 + length + 16 * 2);
-    for trailer in binary[83 + length..].chunks_exact(16) {
+    for trailer in binary[83 + length..].as_chunks::<16>().0 {
         assert_eq!(&trailer[..4], &502u32.to_le_bytes());
         assert!(trailer[4..].iter().all(|&byte| byte == 0));
     }
