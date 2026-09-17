@@ -75,7 +75,9 @@ pub fn hex_float16(bits: u16) -> String {
             exp -= 1;
         }
         m &= 0x3FF;
-        let shifted = m << 14;
+        // Align the normalized 10-bit fraction with the formatter's 23 bits,
+        // just as for normal FP16 values.
+        let shifted = m << 13;
         let mantissa_hex = format_mantissa_hex(shifted);
         let exp_sign = if exp >= 0 { "+" } else { "" };
         return format!("{prefix}0x1{mantissa_hex}p{exp_sign}{exp}");
@@ -265,6 +267,101 @@ mod tests {
     fn fp16_zero_one() {
         assert_eq!(hex_float16(0x0000), "0x0p+0");
         assert_eq!(hex_float16(0x3C00), "0x1p+0");
+    }
+
+    // Parse the emitted significand numerically, independently of the bit
+    // normalization used by either formatter. All values here fit exactly in f64.
+    fn parse_finite_hex(text: &str) -> f64 {
+        let (sign, magnitude) = match text.strip_prefix('-') {
+            Some(magnitude) => (-1.0, magnitude),
+            None => (1.0, text),
+        };
+        let (significand, exponent) = magnitude
+            .strip_prefix("0x")
+            .unwrap()
+            .split_once('p')
+            .unwrap();
+        let exponent: i32 = exponent.parse().unwrap();
+        let (integer, fraction) = significand.split_once('.').unwrap_or((significand, ""));
+        let digits = format!("{integer}{fraction}");
+        let significand = u64::from_str_radix(&digits, 16).unwrap() as f64;
+        sign * significand * 2.0_f64.powi(exponent - 4 * fraction.len() as i32)
+    }
+
+    #[test]
+    fn fp16_subnormal_literals() {
+        for (bits, expected) in [
+            (0x0001, "0x1p-24"),
+            (0x0003, "0x1.8p-23"),
+            (0x00a8, "0x1.5p-17"), // Normalization epsilon rounded to FP16.
+            (0x03ff, "0x1.ff8p-15"),
+            (0x0400, "0x1p-14"),
+        ] {
+            assert_eq!(hex_float16(bits), expected);
+            assert_eq!(hex_float16(bits | 0x8000), format!("-{expected}"));
+        }
+    }
+
+    #[test]
+    fn fp16_all_bit_patterns_preserve_value() {
+        for bits in 0..=u16::MAX {
+            let text = hex_float16(bits);
+            let exponent = (bits >> 10) & 0x1f;
+            let fraction = bits & 0x3ff;
+            if exponent == 0x1f {
+                let expected = if fraction != 0 {
+                    "nan"
+                } else if bits & 0x8000 != 0 {
+                    "-inf"
+                } else {
+                    "inf"
+                };
+                assert_eq!(text, expected, "bits {bits:#06x}");
+                continue;
+            }
+            // IEEE 754 binary16: subnormals are integer multiples of 2^-24;
+            // normals have an implicit leading 1 and exponent bias 15.
+            let magnitude = if exponent == 0 {
+                f64::from(fraction) * 2.0_f64.powi(-24)
+            } else {
+                f64::from(1024 + fraction) * 2.0_f64.powi(i32::from(exponent) - 25)
+            };
+            let expected = if bits & 0x8000 != 0 {
+                -magnitude
+            } else {
+                magnitude
+            };
+            assert_eq!(
+                parse_finite_hex(&text).to_bits(),
+                expected.to_bits(),
+                "bits {bits:#06x}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp32_both_formatters_preserve_values_at_exponent_boundaries() {
+        // Exercise both allocation paths, both signs, all exponents, and
+        // mantissas near binade/hex-digit boundaries, including subnormals.
+        for exponent in 0..255_u32 {
+            for fraction in [
+                0, 1, 2, 3, 0xf, 0x10, 0x3fffff, 0x400000, 0x7ffffe, 0x7fffff,
+            ] {
+                for sign in [0, 1_u32 << 31] {
+                    let bits = sign | exponent << 23 | fraction;
+                    let value = f32::from_bits(bits);
+                    let text = hex_float32(value);
+                    assert_eq!(
+                        parse_finite_hex(&text).to_bits(),
+                        f64::from(value).to_bits(),
+                        "{bits:#010x}"
+                    );
+                    let mut bytes = [0_u8; 16];
+                    let length = hex_float32_bytes(value, &mut bytes);
+                    assert_eq!(&bytes[..length], text.as_bytes(), "{bits:#010x}");
+                }
+            }
+        }
     }
 
     #[test]

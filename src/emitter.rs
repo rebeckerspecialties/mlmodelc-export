@@ -163,7 +163,21 @@ fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
         emit_bindings(bindings, out);
     }
 
-    out.write_str(");\n");
+    out.write_str(")");
+    if !op.attributes.is_empty() {
+        out.write_str("[");
+        let mut attributes: Vec<_> = op.attributes.iter().collect();
+        attributes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (i, (key, value)) in attributes.into_iter().enumerate() {
+            if i > 0 {
+                out.write_str(", ");
+            }
+            out.write_str(&format!("{key} = "));
+            emit_typed_literal(value, out);
+        }
+        out.write_str("]");
+    }
+    out.write_str(";\n");
 }
 
 fn emit_const_operation(
