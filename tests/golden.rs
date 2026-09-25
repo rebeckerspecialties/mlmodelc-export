@@ -20,7 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mlmodelc_export::compile_to_dir;
+use mlmodelc_export::{compile_to_bundle, compile_to_dir};
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -64,13 +64,39 @@ fn fixtures_round_trip() {
 fn check_fixture(dir: &Path) -> Result<(), String> {
     let input = dir.join("input.mlmodel");
     let model_bytes = fs::read(&input).map_err(|e| format!("read input: {e}"))?;
+    let weights = match fs::read(dir.join("weights/weights.bin")) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read weights: {error}")),
+    };
 
     let tmp = std::env::temp_dir().join(format!(
-        "mlmodelc-export-test-{}",
+        "mlmodelc-export-test-{}-{}",
+        std::process::id(),
         dir.file_name().unwrap().to_string_lossy()
     ));
-    let _ = fs::remove_dir_all(&tmp);
-    compile_to_dir(&model_bytes, None, &tmp).map_err(|e| format!("compile: {e:?}"))?;
+    fs::create_dir(&tmp).map_err(|e| format!("create temporary directory: {e}"))?;
+    compile_to_dir(&model_bytes, weights.as_deref(), &tmp)
+        .map_err(|e| format!("compile: {e:?}"))?;
+    let buffered = compile_to_bundle(&model_bytes, weights.as_deref())
+        .map_err(|e| format!("buffered compile: {e:?}"))?;
+    for (name, bytes) in [
+        ("model.mil", &buffered.model_mil),
+        ("coremldata.bin", &buffered.coremldata_bin),
+        ("metadata.json", &buffered.metadata_json),
+        (
+            "analytics/coremldata.bin",
+            &buffered.analytics_coremldata_bin,
+        ),
+    ] {
+        let streamed = fs::read(tmp.join(name)).map_err(|e| format!("read {name}: {e}"))?;
+        if &streamed != bytes {
+            return Err(format!("streaming/buffered output differs: {name}"));
+        }
+    }
+    if buffered.weights_bin != weights {
+        return Err("buffered weights differ from input".into());
+    }
 
     // === Positive: matches expected-macos ===
     let expected = dir.join("expected-macos.mlmodelc");
@@ -80,6 +106,18 @@ fn check_fixture(dir: &Path) -> Result<(), String> {
         &tmp.join("coremldata.bin"),
     )?;
     compare_metadata_json(&expected.join("metadata.json"), &tmp.join("metadata.json"))?;
+    if weights.is_some() {
+        compare_bytes_exact(
+            &dir.join("weights/weights.bin"),
+            &tmp.join("weights/weights.bin"),
+        )?;
+        compare_bytes_exact(
+            &expected.join("weights/weights.bin"),
+            &tmp.join("weights/weights.bin"),
+        )?;
+    } else if tmp.join("weights").exists() {
+        return Err("unexpected weights for an inline-only fixture".into());
+    }
     // analytics/coremldata.bin is structurally tolerated:
     // - coremlc emits a full record (NeuralNetworkModelDetails + Specification-
     //   Details with modelHash + modelName tied to the input filename)

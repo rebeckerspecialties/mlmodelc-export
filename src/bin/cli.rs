@@ -58,15 +58,14 @@ fn read_input(
             .join("com.apple.CoreML")
             .join("model.mlmodel");
         let model_bytes = fs::read(&model)?;
-        let weights_path = explicit_weights
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| {
-                input
-                    .join("Data")
-                    .join("com.apple.CoreML")
-                    .join("weights")
-                    .join("weights.bin")
-            });
+        if let Some(weights_path) = explicit_weights {
+            return Ok((model_bytes, Some(fs::read(weights_path)?)));
+        }
+        let weights_path = input
+            .join("Data")
+            .join("com.apple.CoreML")
+            .join("weights")
+            .join("weights.bin");
         let weights_bytes = if weights_path.exists() {
             Some(fs::read(&weights_path)?)
         } else {

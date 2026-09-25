@@ -42,11 +42,15 @@ func run() throws {
     try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: temporary) }
     var predictions = 0
-    for fixture in ["flexible-range", "flexible-gather", "flexible-multifunction"] {
+    for fixture in ["flexible-range", "flexible-gather", "flexible-multifunction", "flexible-weighted-legacy"] {
         let bundle = temporary.appendingPathComponent(fixture + ".mlmodelc")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
         process.arguments = [root.appendingPathComponent(fixture + "/input.mlmodel").path, bundle.path]
+        let weights = root.appendingPathComponent(fixture + "/weights/weights.bin")
+        if FileManager.default.fileExists(atPath: weights.path) {
+            process.arguments! += ["--weights", weights.path]
+        }
         try process.run()
         process.waitUntilExit()
         try require(process.terminationStatus == 0, "exporter failed")
@@ -69,6 +73,11 @@ func run() throws {
                         return [data[row * 2], data[row * 2 + 1]]
                     }
                     try predict(model, ["data": array([3, 2], data), "indices": array([1, count], indices, type: .int32)], shape: [1, count, 2], values: expected)
+                } else if fixture == "flexible-weighted-legacy" {
+                    let input = (0..<(count * 4)).map { $0 - 8 }
+                    let weights = [2, -3, 5, -7]
+                    let expected = input.enumerated().map { $0.element + weights[$0.offset % 4] }
+                    try predict(model, ["input": array([count, 4], input)], shape: [count, 4], values: expected)
                 } else {
                     let input = (0..<count).map { $0 - 1 }
                     try predict(model, ["input": array([count], input)], shape: [count], values: input.map { max(0, $0) })
