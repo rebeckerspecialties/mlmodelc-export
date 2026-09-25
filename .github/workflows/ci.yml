@@ -59,6 +59,8 @@ jobs:
         run: xcrun --find coremlc
       - run: cargo build --release --all-targets
       - run: cargo test --release
+      - name: Check exact results across flexible input shapes
+        run: swift tests/runtime_shapes.swift target/release/mlmodelc-export tests/fixtures
       - name: Round-trip fixtures via coremlc (regression sanity check)
         # Re-run `xcrun coremlc compile` against each committed input and
         # diff against the committed reference, ignoring lines that

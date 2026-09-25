@@ -1,0 +1,7 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<fp32, [?]> input) [FlexibleShapeInformation = tuple<tuple<string, dict<string, tensor<int32, [?]>>>, tuple<string, dict<string, dict<string, tensor<int32, [?]>>>>>((("DefaultShapes", {{"input", [4]}}), ("EnumeratedShapes", {{"543d0f94", {{"input", [1]}}}, {"697b758f", {{"input", [2]}}}, {"9e38c1a4", {{"input", [4]}}}})))] {
+            tensor<fp32, [?]> output = relu(x = input);
+        } -> (output);
+}

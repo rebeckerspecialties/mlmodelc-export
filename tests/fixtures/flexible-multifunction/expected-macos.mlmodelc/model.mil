@@ -1,0 +1,10 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func first<ios18>(tensor<fp32, [?]> input) [FlexibleShapeInformation = tuple<tuple<string, dict<string, tensor<int32, [?]>>>, tuple<string, dict<string, list<tensor<int32, [2]>, ?>>>>((("DefaultShapes", {{"input", [4]}}), ("RangeDims", {{"input", [[0, 4]]}})))] {
+            tensor<fp32, [?]> output = relu(x = input);
+        } -> (output);
+    func second<ios18>(tensor<fp32, [?]> input) [FlexibleShapeInformation = tuple<tuple<string, dict<string, tensor<int32, [?]>>>, tuple<string, dict<string, list<tensor<int32, [2]>, ?>>>>((("DefaultShapes", {{"input", [2]}}), ("RangeDims", {{"input", [[0, 4]]}})))] {
+            tensor<fp32, [?]> output = relu(x = input);
+        } -> (output);
+}

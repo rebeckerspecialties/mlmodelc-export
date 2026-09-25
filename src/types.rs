@@ -54,16 +54,50 @@ impl MILDataType {
     }
 }
 
+/// A fixed extent or an unknown runtime extent. Zero is a fixed, empty extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MILDimension {
+    Constant(usize),
+    Unknown,
+}
+
+impl std::fmt::Display for MILDimension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Constant(size) => write!(f, "{size}"),
+            Self::Unknown => f.write_str("?"),
+        }
+    }
+}
+
 /// A MIL tensor type: data type + shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MILType {
     pub data_type: MILDataType,
-    pub shape: Vec<usize>,
+    pub shape: Vec<MILDimension>,
 }
 
 impl MILType {
     pub fn new(data_type: MILDataType, shape: Vec<usize>) -> Self {
+        Self::with_dimensions(
+            data_type,
+            shape.into_iter().map(MILDimension::Constant).collect(),
+        )
+    }
+
+    pub fn with_dimensions(data_type: MILDataType, shape: Vec<MILDimension>) -> Self {
         Self { data_type, shape }
+    }
+
+    /// Returns `None` if any extent is determined at runtime.
+    pub fn concrete_shape(&self) -> Option<Vec<usize>> {
+        self.shape
+            .iter()
+            .map(|dimension| match dimension {
+                MILDimension::Constant(size) => Some(*size),
+                MILDimension::Unknown => None,
+            })
+            .collect()
     }
 
     /// Whether this is a scalar (rank-0 tensor).
@@ -144,7 +178,11 @@ impl MILValue {
     /// itself is empty.
     pub fn element_count(&self) -> usize {
         if self.blob.is_some() {
-            return self.r#type.shape.iter().product();
+            return self
+                .r#type
+                .concrete_shape()
+                .map(|shape| shape.iter().product())
+                .unwrap_or(0);
         }
         match &self.tensor {
             MILTensorData::Floats(v) => v.len(),
@@ -202,6 +240,6 @@ pub struct MILProgram {
     /// The spec version from the enclosing `Model` (e.g. 9 for CoreML8/iOS18).
     pub spec_version: i64,
     /// Raw protobuf bytes of `Model.description`. Retained for tools that want
-    /// to round-trip the description; the bundle generator does not consume it.
+    /// to round-trip the description, including flexible shapes and function selection.
     pub description_data: Vec<u8>,
 }

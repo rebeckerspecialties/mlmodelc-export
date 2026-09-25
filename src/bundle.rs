@@ -5,7 +5,7 @@
 //! ```text
 //! example.mlmodelc/
 //!   model.mil          UTF-8 MIL text
-//!   coremldata.bin     binary container with FunctionDescription / defaultFunctionName
+//!   coremldata.bin     binary container with the source ModelDescription
 //!   metadata.json      I/O schema, op histogram, availability matrix
 //!   analytics/
 //!     coremldata.bin   minimal stub satisfying CoreML's analytics check
@@ -18,6 +18,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::description::{FeatureDescription, ModelDescription, ShapeFlexibility, shape_text};
 use crate::types::*;
 
 /// In-memory representation of a `.mlmodelc` bundle, ready to write to disk.
@@ -78,14 +79,9 @@ pub fn build_bundle(
 
 /// Generate `coremldata.bin` from a decoded `MILProgram`.
 ///
-/// iOS 18 / watchOS 11 runtime change: MLPrograms that use external weights
-/// (BlobFileValue refs) require a `FunctionDescription` (proto field 20) +
-/// `defaultFunctionName` (field 21) in the trailer protobuf. A non-empty
-/// `ModelDescription` alone is rejected with
-/// "This MLModel doesn't support the multi-function description sytnax"
-/// (Apple's typo). Older MLPrograms with inline constants still load fine
-/// with just the `ModelDescription`, so we emit both to preserve
-/// compatibility across the two on-device runtimes.
+/// Preserve the source ModelDescription, including feature types, flexible
+/// shapes and single-/multi-function form. Synthesizing it from MIL types loses
+/// defaults and constraints and can make older loaders reject valid models.
 ///
 /// Wire layout (matches `coremlc` 3520.x byte-equivalent):
 ///
@@ -98,27 +94,24 @@ pub fn build_bundle(
 /// 0x24  7    "generic"
 /// 0x2B  1    spec_version as uint8
 /// 0x2C  31   zeros
-/// 0x4B  1    payload_size = trailer_proto_len + 3
-/// 0x4C  7    zeros
-/// 0x53  var  trailer protobuf:
-///              field 20: FunctionDescription for each function
-///              field 21: defaultFunctionName (string)
-/// var   3    a2 06 00 (ModelDescription closing tag, len=0)
-/// var   4    uint32 LE 502 (model type, repeated)
-/// var   12   zeros
+/// 0x4B  8    uint64 LE payload size
+/// 0x53  var  ModelDescription protobuf (includes metadata field 100)
+/// var   16*N per-function trailer: uint32 LE 502 followed by 12 zeros
 /// ```
 pub fn generate_coremldata_bin(program: &MILProgram) -> Vec<u8> {
-    let mut trailer = Vec::new();
-    let mut default_name: Option<&str> = None;
-    for (name, function) in &program.functions {
-        let desc = encode_function_description(name, function);
-        append_proto_length_delimited(&mut trailer, 20, &desc);
-        if default_name.is_none() {
-            default_name = Some(name);
+    let mut trailer = program.description_data.clone();
+    if trailer.is_empty() {
+        // Retain support for callers constructing a static MILProgram directly.
+        for (name, function) in &program.functions {
+            let desc = encode_function_description(name, function);
+            append_proto_length_delimited(&mut trailer, 20, &desc);
+        }
+        if let Some((name, _)) = program.functions.first() {
+            append_proto_string(&mut trailer, 21, name);
         }
     }
-    if let Some(name) = default_name {
-        append_proto_string(&mut trailer, 21, name);
+    if !ModelDescription::decode(&trailer).has_metadata {
+        append_proto_length_delimited(&mut trailer, 100, &[]);
     }
 
     let desc_len = trailer.len();
@@ -132,14 +125,14 @@ pub fn generate_coremldata_bin(program: &MILProgram) -> Vec<u8> {
     bin.extend_from_slice(b"generic");
     bin.push((program.spec_version & 0xFF) as u8);
     bin.extend(std::iter::repeat_n(0u8, 31));
-    bin.push(((desc_len + 3) & 0xFF) as u8);
-    bin.extend(std::iter::repeat_n(0u8, 7));
+    append_u64_le(&mut bin, desc_len as u64);
 
     bin.extend_from_slice(&trailer);
 
-    bin.extend_from_slice(&[0xa2, 0x06, 0x00]);
-    append_u32_le(&mut bin, 502);
-    bin.extend(std::iter::repeat_n(0u8, 12));
+    for _ in 0..program.functions.len().max(1) {
+        append_u32_le(&mut bin, 502);
+        bin.extend(std::iter::repeat_n(0u8, 12));
+    }
     bin
 }
 
@@ -167,16 +160,20 @@ fn append_analytics_entry(bin: &mut Vec<u8>, key: &str, value: &str) {
 
 /// Generate `metadata.json`.
 ///
-/// The output shape matches Apple `coremlc` 3520.x for CoreML8 / iOS18
-/// MLPrograms. iOS 18+ loaders require the `functions` array and
-/// `defaultFunctionName` at the top level when the model uses external
-/// weights — without them MLModel rejects with the same multi-function
-/// syntax error noted above.
+/// I/O schemas use the source defaults and constraints. Operation statistics
+/// describe the source MIL graph rather than Apple's optimized executable.
 pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
-    let main_func = program.functions.first();
+    let description = ModelDescription::decode(&program.description_data);
+    let multifunction = !description.functions.is_empty() || program.description_data.is_empty();
+    let main_func = program
+        .functions
+        .iter()
+        .find(|(name, _)| name == &description.default_function)
+        .or_else(|| program.functions.first());
     let main_name: String = main_func
         .map(|(n, _)| n.clone())
         .unwrap_or_else(|| "main".to_string());
+    let main_description = description.function(&main_name);
 
     let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     if let Some((_, f)) = main_func {
@@ -228,7 +225,11 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.push_str("    \"metadataOutputVersion\" : \"3.0\",\n");
     json.push_str(&format!(
         "    \"outputSchema\" : {},\n",
-        schema_list(&output_types, "    ")
+        schema_list(
+            &output_types,
+            main_description.map(|d| d.outputs.as_slice()),
+            "    "
+        )
     ));
     json.push_str("    \"modelParameters\" : [\n\n    ],\n");
     json.push_str(&format!(
@@ -236,39 +237,77 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         program.spec_version
     ));
 
-    // Functions array (required for iOS 18+). Field order matches Apple's
+    // Functions array only when the source uses multi-function descriptions.
+    // Field order matches Apple's
     // coremlc 3520.x output: computePrecision, outputSchema, stateSchema,
     // name, mlProgramOperationTypeHistogram, inputSchema. coremlc does NOT
     // emit `storagePrecision` here — keeping our output aligned.
-    json.push_str("    \"functions\" : [\n");
-    json.push_str("      {\n");
-    json.push_str(&format!(
-        "        \"computePrecision\" : \"{precision}\",\n"
-    ));
-    json.push_str(&format!(
-        "        \"outputSchema\" : {},\n",
-        schema_list(&output_types, "        ")
-    ));
-    json.push_str("        \"stateSchema\" : [\n\n        ],\n");
-    json.push_str(&format!("        \"name\" : \"{main_name}\",\n"));
-    json.push_str("        \"mlProgramOperationTypeHistogram\" : {\n");
-    let hist_entries: Vec<(&String, &usize)> = hist.iter().collect();
-    for (i, (k, v)) in hist_entries.iter().enumerate() {
-        json.push_str(&format!("          \"{k}\" : {v}"));
-        if i < hist_entries.len() - 1 {
-            json.push(',');
+    if multifunction {
+        json.push_str("    \"functions\" : [\n");
+        for (index, (function_name, function)) in program.functions.iter().enumerate() {
+            let function_description = description.function(function_name);
+            let function_inputs: Vec<_> = function
+                .inputs
+                .iter()
+                .map(|input| (input.name.clone(), input.r#type.clone()))
+                .collect();
+            let function_outputs: Vec<_> = function
+                .block
+                .outputs
+                .iter()
+                .map(|name| (name.clone(), find_output_type(name, &function.block)))
+                .collect();
+            json.push_str("      {\n");
+            json.push_str(&format!(
+                "        \"computePrecision\" : \"{precision}\",\n"
+            ));
+            json.push_str(&format!(
+                "        \"outputSchema\" : {},\n",
+                schema_list(
+                    &function_outputs,
+                    function_description.map(|d| d.outputs.as_slice()),
+                    "        "
+                )
+            ));
+            json.push_str("        \"stateSchema\" : [\n\n        ],\n");
+            json.push_str(&format!(
+                "        \"name\" : {},\n",
+                json_string(function_name)
+            ));
+            json.push_str("        \"mlProgramOperationTypeHistogram\" : {\n");
+            let mut function_hist = std::collections::BTreeMap::<String, usize>::new();
+            for op in &function.block.operations {
+                *function_hist
+                    .entry(format!("{}.{}", opset_prefix(&function.opset), op.r#type))
+                    .or_default() += 1;
+            }
+            for (i, (k, v)) in function_hist.iter().enumerate() {
+                json.push_str(&format!("          \"{k}\" : {v}"));
+                if i < function_hist.len() - 1 {
+                    json.push(',');
+                }
+                json.push('\n');
+            }
+            json.push_str("        },\n");
+            json.push_str(&format!(
+                "        \"inputSchema\" : {}\n",
+                schema_list(
+                    &function_inputs,
+                    function_description.map(|d| d.inputs.as_slice()),
+                    "        "
+                )
+            ));
+            json.push_str("      }");
+            if index + 1 < program.functions.len() {
+                json.push(',');
+            }
+            json.push('\n');
         }
-        json.push('\n');
+        json.push_str("    ],\n");
     }
-    json.push_str("        },\n");
-    json.push_str(&format!(
-        "        \"inputSchema\" : {}\n",
-        schema_list(&inputs, "        ")
-    ));
-    json.push_str("      }\n");
-    json.push_str("    ],\n");
 
     json.push_str("    \"mlProgramOperationTypeHistogram\" : {\n");
+    let hist_entries: Vec<(&String, &usize)> = hist.iter().collect();
     for (i, (k, v)) in hist_entries.iter().enumerate() {
         json.push_str(&format!("      \"{k}\" : {v}"));
         if i < hist_entries.len() - 1 {
@@ -297,9 +336,18 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.push_str("    },\n");
     json.push_str(&format!(
         "    \"inputSchema\" : {},\n",
-        schema_list(&inputs, "    ")
+        schema_list(
+            &inputs,
+            main_description.map(|d| d.inputs.as_slice()),
+            "    "
+        )
     ));
-    json.push_str(&format!("    \"defaultFunctionName\" : \"{main_name}\",\n"));
+    if multifunction {
+        json.push_str(&format!(
+            "    \"defaultFunctionName\" : {},\n",
+            json_string(&main_name)
+        ));
+    }
     json.push_str("    \"generatedClassName\" : \"model\",\n");
     json.push_str("    \"userDefinedMetadata\" : {\n\n    },\n");
     json.push_str("    \"method\" : \"predict\"\n");
@@ -309,13 +357,19 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.into_bytes()
 }
 
-fn schema_list(entries: &[(String, MILType)], indent: &str) -> String {
+fn schema_list(
+    entries: &[(String, MILType)],
+    features: Option<&[FeatureDescription]>,
+    indent: &str,
+) -> String {
     if entries.is_empty() {
         return format!("[\n\n{indent}]");
     }
     let mut s = String::from("[\n");
     for (i, (name, ty)) in entries.iter().enumerate() {
-        s.push_str(&schema_entry(name, ty, &format!("{indent}  ")));
+        let feature =
+            features.and_then(|features| features.iter().find(|feature| &feature.name == name));
+        s.push_str(&schema_entry(name, ty, feature, &format!("{indent}  ")));
         if i < entries.len() - 1 {
             s.push(',');
         }
@@ -326,33 +380,118 @@ fn schema_list(entries: &[(String, MILType)], indent: &str) -> String {
     s
 }
 
-fn schema_entry(name: &str, r#type: &MILType, indent: &str) -> String {
-    let dt_str = format_data_type_for_meta(r#type.data_type);
-    let shape_str: String = r#type
-        .shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let formatted_shape: String = r#type
-        .shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(" \u{00d7} ");
+fn schema_entry(
+    name: &str,
+    r#type: &MILType,
+    feature: Option<&FeatureDescription>,
+    indent: &str,
+) -> String {
+    let dt_str = match feature.map(|f| f.data_type) {
+        Some(65568) => "Float32",
+        Some(65552) => "Float16",
+        Some(65600) => "Double",
+        Some(131104) => "Int32",
+        Some(131080) => "Int8",
+        _ => format_data_type_for_meta(r#type.data_type),
+    };
+    let dimensions: Vec<_> = feature
+        .map(|f| f.default_shape().iter().map(ToString::to_string).collect())
+        .unwrap_or_else(|| r#type.shape.iter().map(ToString::to_string).collect());
+    let shape_str = dimensions.join(", ");
+    let formatted_shape = dimensions.join(" \u{00d7} ");
     let mut s = format!("{indent}{{\n");
-    s.push_str(&format!("{indent}  \"hasShapeFlexibility\" : \"0\",\n"));
-    s.push_str(&format!("{indent}  \"isOptional\" : \"0\",\n"));
+    let flexibility = feature.and_then(|f| f.flexibility.as_ref());
+    s.push_str(&format!(
+        "{indent}  \"hasShapeFlexibility\" : \"{}\",\n",
+        u8::from(flexibility.is_some())
+    ));
+    s.push_str(&format!(
+        "{indent}  \"isOptional\" : \"{}\",\n",
+        u8::from(feature.is_some_and(|f| f.optional))
+    ));
+    if let Some(flexibility) = flexibility {
+        let (key, value, formatted) = match flexibility {
+            ShapeFlexibility::Ranges(ranges) => (
+                "shapeRange",
+                format!(
+                    "[{}]",
+                    ranges
+                        .iter()
+                        .map(|(lo, hi)| format!("[{lo}, {hi}]"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ranges
+                    .iter()
+                    .map(|(lo, hi)| {
+                        if *lo as i64 == *hi {
+                            lo.to_string()
+                        } else {
+                            format!("{lo}...{hi}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" × "),
+            ),
+            ShapeFlexibility::Enumerated(shapes) => (
+                "enumeratedShapes",
+                format!(
+                    "[{}]",
+                    shapes
+                        .iter()
+                        .map(|shape| shape_text(shape))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                shapes
+                    .iter()
+                    .map(|shape| {
+                        shape
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" × ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        };
+        s.push_str(&format!("{indent}  \"{key}\" : {},\n", json_string(&value)));
+        s.push_str(&format!(
+            "{indent}  \"shapeFlexibility\" : {},\n",
+            json_string(&formatted)
+        ));
+    }
     s.push_str(&format!("{indent}  \"dataType\" : \"{dt_str}\",\n"));
     s.push_str(&format!(
         "{indent}  \"formattedType\" : \"MultiArray ({dt_str} {formatted_shape})\",\n"
     ));
-    s.push_str(&format!("{indent}  \"shortDescription\" : \"\",\n"));
+    s.push_str(&format!(
+        "{indent}  \"shortDescription\" : {},\n",
+        json_string(feature.map(|f| f.short_description.as_str()).unwrap_or(""))
+    ));
     s.push_str(&format!("{indent}  \"shape\" : \"[{shape_str}]\",\n"));
-    s.push_str(&format!("{indent}  \"name\" : \"{name}\",\n"));
+    s.push_str(&format!("{indent}  \"name\" : {},\n", json_string(name)));
     s.push_str(&format!("{indent}  \"type\" : \"MultiArray\"\n"));
     s.push_str(&format!("{indent}}}"));
     s
+}
+
+fn json_string(text: &str) -> String {
+    let mut result = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            ch if ch.is_control() => result.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
 }
 
 fn format_data_type_for_meta(dt: MILDataType) -> &'static str {
@@ -437,7 +576,11 @@ fn encode_function_description(name: &str, function: &MILFunction) -> Vec<u8> {
 fn encode_feature_description(name: &str, ty: &MILType) -> Vec<u8> {
     let mut bin = Vec::new();
     append_proto_string(&mut bin, 1, name);
-    let feature_type = encode_feature_type(&ty.shape, ty.data_type);
+    let feature_type = encode_feature_type(
+        &ty.concrete_shape()
+            .expect("a synthesized feature description needs a concrete shape"),
+        ty.data_type,
+    );
     append_proto_length_delimited(&mut bin, 3, &feature_type);
     bin
 }

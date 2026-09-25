@@ -43,6 +43,7 @@
 
 mod bundle;
 mod decoder;
+mod description;
 mod emitter;
 mod hex_float;
 mod pb_reader;
@@ -61,8 +62,8 @@ pub use emitter::{emit, emit_to_string};
 pub use hex_float::{hex_float16, hex_float32, hex_float32_bytes};
 pub use sink::MILOutputSink;
 pub use types::{
-    MILBinding, MILBlobRef, MILBlock, MILDataType, MILFunction, MILNamedType, MILOperation,
-    MILProgram, MILTensorData, MILType, MILValue,
+    MILBinding, MILBlobRef, MILBlock, MILDataType, MILDimension, MILFunction, MILNamedType,
+    MILOperation, MILProgram, MILTensorData, MILType, MILValue,
 };
 
 /// Statistics computed from a single compile pass.

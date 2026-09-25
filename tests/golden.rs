@@ -6,10 +6,10 @@
 //! 1. **Positive**: our output's `model.mil` and `coremldata.bin` are
 //!    byte-identical to `expected-macos.mlmodelc/` (modulo the buildInfo
 //!    component string in `model.mil`, which legitimately identifies a
-//!    different producer). `metadata.json` is compared with whitespace and
-//!    JSON-key-order tolerance (`semantic_json_eq`) — Apple's coremlc and
-//!    our emitter both produce the same fields and values, but in slightly
-//!    different declaration order.
+//!    different producer). `metadata.json` is compared structurally, excluding
+//!    generated class names and optimization statistics: those describe Apple's
+//!    compiler passes rather than the source MIL graph. I/O schemas, defaults,
+//!    constraints and function selection must match.
 //! 2. **Negative**: our output does NOT match the broken pattern in
 //!    `observed-watchos-broken.mlmodelc/`. Specifically:
 //!    - we always emit `model.mil` (the watchOS stub doesn't),
@@ -148,76 +148,40 @@ fn compare_bytes_exact(expected: &Path, actual: &Path) -> Result<(), String> {
     ))
 }
 
-/// Compare `metadata.json` with key-order tolerance: tokenise both files,
-/// strip whitespace and quoted commas, and check the resulting key/value
-/// multisets match. This accepts coremlc's declaration order or ours, since
-/// both are accepted by `MLModel(contentsOfURL:)` in practice.
+/// Compare JSON structure, including array order and field ownership.
 fn compare_metadata_json(expected: &Path, actual: &Path) -> Result<(), String> {
     let e = fs::read_to_string(expected).map_err(|err| format!("read {expected:?}: {err}"))?;
     let a = fs::read_to_string(actual).map_err(|err| format!("read {actual:?}: {err}"))?;
-    let e_tokens = tokenize_metadata_json(&e);
-    let a_tokens = tokenize_metadata_json(&a);
-    if e_tokens == a_tokens {
+    let mut e: serde_json::Value = serde_json::from_str(&e).map_err(|e| e.to_string())?;
+    let mut a: serde_json::Value = serde_json::from_str(&a).map_err(|e| e.to_string())?;
+    normalize_metadata(&mut e);
+    normalize_metadata(&mut a);
+    if e == a {
         return Ok(());
     }
     Err(format!(
-        "metadata.json semantic content differs (key-order tolerant):\n--- expected ({} tokens) ---\n{}\n--- actual ({} tokens) ---\n{}",
-        e_tokens.len(),
-        e_tokens
-            .iter()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" | "),
-        a_tokens.len(),
-        a_tokens
-            .iter()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" | "),
+        "metadata.json differs:\n--- expected ---\n{e:#}\n--- actual ---\n{a:#}",
     ))
 }
 
-/// Cheap tokeniser: split on whitespace and structural punctuation, then
-/// sort the resulting bag. Good enough for "do these two JSONs say the same
-/// thing without caring about declaration order"; not a proper JSON parser.
-///
-/// `generatedClassName` is masked because Apple's `coremlc` defaults it to
-/// the input filename stem (e.g. `"input"` for `input.mlmodel`), whereas
-/// we always emit a stable `"model"`. Both are accepted by `MLModel`.
-fn tokenize_metadata_json(s: &str) -> Vec<String> {
-    let masked = mask_generated_class_name(s);
-    let mut out: Vec<String> = masked
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .map(|t| {
-            t.trim_matches(|c: char| c == ',' || c.is_whitespace())
-                .to_string()
-        })
-        .filter(|t| !t.is_empty())
-        .collect();
-    out.sort();
-    out
-}
-
-fn mask_generated_class_name(s: &str) -> String {
-    let key = "\"generatedClassName\" :";
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(idx) = rest.find(key) {
-        out.push_str(&rest[..idx]);
-        out.push_str(key);
-        rest = &rest[idx + key.len()..];
-        if let Some(end) = rest.find(',').or_else(|| rest.find('\n')) {
-            out.push_str(" \"<masked>\"");
-            rest = &rest[end..];
-        } else {
-            out.push_str(rest);
-            return out;
+fn normalize_metadata(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in [
+                "generatedClassName",
+                "computePrecision",
+                "storagePrecision",
+                "mlProgramOperationTypeHistogram",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                normalize_metadata(child);
+            }
         }
+        serde_json::Value::Array(array) => array.iter_mut().for_each(normalize_metadata),
+        _ => {}
     }
-    out.push_str(rest);
-    out
 }
 
 fn require_analytics_present(ours: &Path) -> Result<(), String> {
