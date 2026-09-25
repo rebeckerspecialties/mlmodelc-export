@@ -220,10 +220,46 @@ fn decode_value(data: &[u8]) -> Result<MILValue, MILDecoderError> {
         }
     }
 
-    if r#type.concrete_shape().is_none() {
+    let Some(shape) = r#type.concrete_shape() else {
         return Err(MILDecoderError::UnsupportedFormat(
             "immediate/blob values must have concrete dimensions".into(),
         ));
+    };
+    // TensorValue.bytes is shared by FP16 and 8-bit integers. Its storage
+    // width and interpretation come from Value.type, not from the wire field.
+    if blob.is_none()
+        && let MILTensorData::Fp16Bytes(bytes) = tensor
+    {
+        let width: usize = match r#type.data_type {
+            MILDataType::Float16 => 2,
+            MILDataType::Int8 | MILDataType::Uint8 => 1,
+            dtype => {
+                return Err(MILDecoderError::UnsupportedFormat(format!(
+                    "byte tensor storage for {}",
+                    dtype.text_name()
+                )));
+            }
+        };
+        let expected_bytes = shape
+            .iter()
+            .try_fold(width, |length, &size| length.checked_mul(size))
+            .ok_or_else(|| {
+                MILDecoderError::UnsupportedFormat("byte tensor size exceeds platform size".into())
+            })?;
+        if bytes.len() != expected_bytes {
+            return Err(MILDecoderError::UnsupportedFormat(format!(
+                "{} byte tensor needs {expected_bytes} bytes, got {}",
+                r#type.data_type.text_name(),
+                bytes.len()
+            )));
+        }
+        tensor = match r#type.data_type {
+            MILDataType::Int8 => {
+                MILTensorData::Ints(bytes.into_iter().map(|byte| byte as i8 as i32).collect())
+            }
+            MILDataType::Uint8 => MILTensorData::Ints(bytes.into_iter().map(i32::from).collect()),
+            _ => MILTensorData::Fp16Bytes(bytes),
+        };
     }
     Ok(MILValue {
         r#type,
