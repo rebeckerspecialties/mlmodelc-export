@@ -154,11 +154,13 @@ swift tests/runtime_shapes.swift target/release/mlmodelc-export tests/fixtures
 ```
 
 This compiles the checked-in protobufs through the Rust exporter before loading
-them with CoreML. It does not load the precompiled golden references. The 24
+them with CoreML. It does not load the precompiled golden references. The 28
 exact predictions include a legacy single-function model with external weights,
 growing and shrinking its input on the same loaded model. Its small source
 fixture and independent expected values need no model download. These macOS
-runtime checks do not substitute for physical iOS/watchOS validation.
+runtime checks do not substitute for physical iOS/watchOS validation. Separate
+exact checks cover FP16 subnormal constants cast to FP32 and int8 compressed
+weights with typed dequantization parameters.
 
 For large dense Float32 constants (>10⁵ elements) the streaming path uses an
 allocation-free hex-float byte formatter (see

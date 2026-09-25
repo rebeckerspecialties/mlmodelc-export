@@ -80,7 +80,7 @@ from [Apple's Core ML format schemas](https://github.com/apple/coremltools/tree/
 `tests/unsupported/flexible-enumerated` retains native output for a future
 implementation; the current test requires an explicit unsupported-format error.
 
-`tests/runtime_shapes.swift` additionally checks 24 exact predictions, including
+`tests/runtime_shapes.swift` additionally checks 28 exact predictions, including
 1 -> 2 -> 4 -> 1 input changes on each loaded model and default/named function
 selection. The weighted fixture checks all 32 output values against ordinary
 integer addition. Run it as documented in the repository README.
@@ -100,3 +100,22 @@ python3 tests/fixtures/generate_weighted.py --check
 The generator does not create golden output. Capture that separately using
 Apple's compiler; keep the source `weights/` beside `input.mlmodel` during
 compilation. CI checks that committed inputs match the generator.
+
+## Precision regressions
+
+`fp16-subnormal-cast` retains positive and negative FP16 subnormal constants,
+casts to FP32 and adds a runtime input. `quantized-constexpr` dequantizes int8
+blob weights with typed `axis`, `scale` and `zero_point` attributes before
+adding a runtime input. Both source fixtures are smaller than 1 KB, use no
+downloaded assets, and have independently specified exact runtime results.
+
+```sh
+python3 -B tests/fixtures/generate_precision.py
+python3 -B tests/fixtures/generate_precision.py --check
+```
+
+See [precision fixture provenance and value formulas](PRECISION.md) for native
+compiler capture details and hashes. The golden comparison detects the old
+FP16 mantissa alignment and dropped constexpr attributes without executing
+CoreML. Runtime checks use FP32 outputs with CPU-only execution and no tolerance
+that could hide flushed subnormals or an incorrect dequantization parameter.

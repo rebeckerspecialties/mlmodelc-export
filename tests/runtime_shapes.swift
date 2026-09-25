@@ -24,15 +24,20 @@ func coordinates(_ index: Int, _ shape: [Int]) -> [NSNumber] {
     return result
 }
 func predict(_ model: MLModel, _ inputs: [String: MLMultiArray], shape: [Int], values: [Int]) throws {
+    try predictExact(model, inputs, shape: shape, values: values.map(Double.init))
+}
+func predictExact(_ model: MLModel, _ inputs: [String: MLMultiArray], shape: [Int], values: [Double]) throws {
     let features = try MLDictionaryFeatureProvider(dictionary: inputs.mapValues(MLFeatureValue.init(multiArray:)))
     let prediction = try model.prediction(from: features)
     guard let output = prediction.featureValue(for: "output")?.multiArrayValue else {
         throw Failure(message: "missing output")
     }
+    try require(output.dataType == .float32, "incorrect output dtype")
     try require(output.shape.map(\.intValue) == shape, "incorrect output shape")
     try require(output.count == values.count, "incorrect element count")
     for (index, value) in values.enumerated() {
-        try require(output[coordinates(index, shape)].doubleValue == Double(value), "incorrect element \(index)")
+        let actual = output[coordinates(index, shape)].doubleValue
+        try require(actual.isFinite && actual == value, "incorrect element \(index): \(actual), expected \(value)")
     }
 }
 func run() throws {
@@ -42,7 +47,7 @@ func run() throws {
     try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: temporary) }
     var predictions = 0
-    for fixture in ["flexible-range", "flexible-gather", "flexible-multifunction", "flexible-weighted-legacy"] {
+    for fixture in ["flexible-range", "flexible-gather", "flexible-multifunction", "flexible-weighted-legacy", "fp16-subnormal-cast", "quantized-constexpr"] {
         let bundle = temporary.appendingPathComponent(fixture + ".mlmodelc")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
@@ -60,6 +65,24 @@ func run() throws {
             configuration.computeUnits = .cpuOnly
             configuration.functionName = function
             let model = try MLModel(contentsOf: bundle, configuration: configuration)
+            if fixture == "fp16-subnormal-cast" || fixture == "quantized-constexpr" {
+                // Binary16 subnormals are integer multiples of 2^-24; the
+                // smallest normal is 1024 such units. The second fixture uses
+                // (int8 + 1) / 2. Neither oracle reads emitted model data.
+                let values: [Double] = fixture == "fp16-subnormal-cast"
+                    ? [1, 168, 1023, 1024, -168].map { Double($0) / 16_777_216 }
+                    : [-63.5, 0, 0.5, 64]
+                let offsets: [Double] = fixture == "fp16-subnormal-cast" ? [0, 1.0 / 16_384] : [0, 1]
+                for offset in offsets {
+                    let input = try array([values.count], [Int](repeating: 0, count: values.count))
+                    for index in values.indices {
+                        input[coordinates(index, [values.count])] = NSNumber(value: offset)
+                    }
+                    try predictExact(model, ["input": input], shape: [values.count], values: values.map { $0 + offset })
+                    predictions += 1
+                }
+                continue
+            }
             if fixture == "flexible-multifunction" {
                 let expectedDefault = function == "first" ? 4 : 2
                 try require(model.modelDescription.inputDescriptionsByName["input"]?.multiArrayConstraint?.shape == [NSNumber(value: expectedDefault)], "wrong default function/schema")

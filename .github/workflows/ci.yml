@@ -30,6 +30,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Verify generated weighted fixture sources
         run: python3 tests/fixtures/generate_weighted.py --check
+      - name: Verify generated precision fixture sources
+        run: python3 -B tests/fixtures/generate_precision.py --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release --all-targets
       - run: cargo test --release
