@@ -28,6 +28,8 @@ jobs:
             target
           key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --all -- --check
+      - name: Verify generated weighted fixture sources
+        run: python3 tests/fixtures/generate_weighted.py --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release --all-targets
       - run: cargo test --release

@@ -5,6 +5,7 @@ Each subdirectory under `tests/fixtures/` is one test case. Layout:
 ```
 tests/fixtures/<name>/
   input.mlmodel                       # raw CoreML protobuf (input)
+  weights/weights.bin                 # optional source external weights
   expected-macos.mlmodelc/             # output produced by `xcrun coremlc compile`
     model.mil
     coremldata.bin
@@ -67,6 +68,11 @@ Then re-run `cargo test` — the harness auto-discovers the new directory.
 - `flexible-multifunction`: two ReLU functions with different default input
   shapes, the second selected by default, and a description exceeding 255 bytes.
   Reference captured with Xcode 27.0 (27A266a), coremlc 3600.25.1.
+- `flexible-weighted-legacy`: FP32 input `[?, 4]` plus an external four-element
+  weight vector, retaining legacy input/output descriptions (no function list).
+  Default shape `[1, 4]`, ranges `[[1, 4], [4, 4]]`. This small fixture covers
+  the description/weight combination used by transformer models without model
+  downloads. See [its provenance](flexible-weighted-legacy/PROVENANCE.md).
 
 `generate_flexible.py` derives the multi-function fixture and an unsupported
 enumerated-shape fixture from `flexible-range`. It uses `Model_pb2` generated
@@ -74,6 +80,23 @@ from [Apple's Core ML format schemas](https://github.com/apple/coremltools/tree/
 `tests/unsupported/flexible-enumerated` retains native output for a future
 implementation; the current test requires an explicit unsupported-format error.
 
-`tests/runtime_shapes.swift` additionally checks 20 exact predictions, including
+`tests/runtime_shapes.swift` additionally checks 24 exact predictions, including
 1 -> 2 -> 4 -> 1 input changes on each loaded model and default/named function
-selection. Run it as documented in the repository README.
+selection. The weighted fixture checks all 32 output values against ordinary
+integer addition. Run it as documented in the repository README.
+
+The golden harness supplies optional source weights, checks their output bytes
+against both the source and native golden, and compares every emitted file with
+the buffered API. `tests/weighted_legacy.rs` also checks CLI explicit weights,
+package auto-detection, and rejection of missing explicit weight paths.
+
+Regenerate the weighted fixture's inputs without external Python dependencies:
+
+```sh
+python3 tests/fixtures/generate_weighted.py
+python3 tests/fixtures/generate_weighted.py --check
+```
+
+The generator does not create golden output. Capture that separately using
+Apple's compiler; keep the source `weights/` beside `input.mlmodel` during
+compilation. CI checks that committed inputs match the generator.
