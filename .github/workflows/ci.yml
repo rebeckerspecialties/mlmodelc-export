@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Include stacked PRs before their base branch is merged into main.
   pull_request:
-    branches: [main]
 
 jobs:
   # Linux build verifies the crate is platform-portable. The fixture-compare
