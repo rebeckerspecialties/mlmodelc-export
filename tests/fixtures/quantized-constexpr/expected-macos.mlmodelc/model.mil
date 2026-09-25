@@ -1,0 +1,8 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<fp32, [4]> input) {
+            tensor<fp32, [4]> constant = constexpr_affine_dequantize()[axis = int32(0), quantized_data = tensor<int8, [4]>(BLOBFILE(path = string("@model_path/weights/weights.bin"), offset = uint64(64))), scale = fp32(0x1p-1), zero_point = int8(-1)];
+            tensor<fp32, [4]> output = add(x = input, y = constant);
+        } -> (output);
+}
