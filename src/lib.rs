@@ -49,7 +49,9 @@ mod hex_float;
 mod pb_reader;
 mod sink;
 mod types;
+mod weights;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -126,14 +128,50 @@ pub fn compile_to_text(protobuf: &[u8]) -> Result<CompileResult, Error> {
 
 /// Compile a CoreML protobuf into a complete `.mlmodelc` bundle in memory.
 ///
-/// `weights` is the contents of `weights/weights.bin` if the input model
-/// references external blob weights (`BlobFileValue` entries in the MLProgram
-/// protobuf). Pass `None` for inline-constant models.
+/// `weights` supplies the model's single referenced external file, preserving
+/// its filename. Pass `None` for inline-constant models. Missing assets fail
+/// explicitly. Use [`compile_to_bundle_with_weight_files`] for multiple files.
 pub fn compile_to_bundle(protobuf: &[u8], weights: Option<&[u8]>) -> Result<MlmodelcBundle, Error> {
     let program = decode(protobuf)?;
-    let mil_text = emit_to_string(&program);
-    let bundle = build_bundle(&program, mil_text.into_bytes(), weights.map(|w| w.to_vec()));
-    Ok(bundle)
+    let files = weights::single_file(&program, weights)?;
+    Ok(bundle_with_files(&program, &files))
+}
+
+/// The sorted, unique external weight paths referenced by a model, relative
+/// to `@model_path/`. Invalid or nonportable paths are rejected.
+pub fn referenced_weight_paths(protobuf: &[u8]) -> Result<Vec<String>, Error> {
+    Ok(weights::references(&decode(protobuf)?)?
+        .into_keys()
+        .collect())
+}
+
+/// Compile with named external files. Keys are bundle-relative paths returned
+/// by [`referenced_weight_paths`], such as `weights/weight.bin`. File bytes,
+/// names and reference offsets are preserved; all references must resolve.
+pub fn compile_to_bundle_with_weight_files(
+    protobuf: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<MlmodelcBundle, Error> {
+    let program = decode(protobuf)?;
+    weights::validate_files(&program, files)?;
+    Ok(bundle_with_files(&program, files))
+}
+
+fn bundle_with_files<T: AsRef<[u8]>>(
+    program: &MILProgram,
+    files: &BTreeMap<String, T>,
+) -> MlmodelcBundle {
+    let mut bundle = build_bundle(program, emit_to_string(program).into_bytes(), None);
+    for (path, bytes) in files {
+        if path == "weights/weights.bin" {
+            bundle.weights_bin = Some(bytes.as_ref().to_vec());
+        } else {
+            bundle
+                .weight_files
+                .insert(path.clone(), bytes.as_ref().to_vec());
+        }
+    }
+    bundle
 }
 
 /// Streaming variant of [`compile_to_bundle`]: write the bundle directly to
@@ -145,8 +183,29 @@ pub fn compile_to_dir(
     directory: impl AsRef<Path>,
 ) -> Result<CompileStats, Error> {
     let program = decode(protobuf)?;
-    let dir = directory.as_ref();
-    fs::create_dir_all(dir)?;
+    let files = weights::single_file(&program, weights)?;
+    compile_program_to_dir(protobuf, &program, &files, directory.as_ref())
+}
+
+/// Streaming MIL emission with named external files. Like [`compile_to_dir`],
+/// weight data is borrowed, not cloned. References are validated before writing.
+pub fn compile_to_dir_with_weight_files(
+    protobuf: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+    directory: impl AsRef<Path>,
+) -> Result<CompileStats, Error> {
+    let program = decode(protobuf)?;
+    weights::validate_files(&program, files)?;
+    compile_program_to_dir(protobuf, &program, files, directory.as_ref())
+}
+
+fn compile_program_to_dir<T: AsRef<[u8]>>(
+    protobuf: &[u8],
+    program: &MILProgram,
+    files: &BTreeMap<String, T>,
+    dir: &Path,
+) -> Result<CompileStats, Error> {
+    weights::prepare_directory(dir, files.keys())?;
 
     let mil_path = dir.join("model.mil");
     if mil_path.exists() {
@@ -154,15 +213,12 @@ pub fn compile_to_dir(
     }
     let file = fs::File::create(&mil_path)?;
     let mut sink = MILOutputSink::streaming(file);
-    emit(&program, &mut sink);
+    emit(program, &mut sink);
     let bytes_written = sink.bytes_written();
     let _ = sink.finalize()?;
 
-    fs::write(
-        dir.join("coremldata.bin"),
-        generate_coremldata_bin(&program),
-    )?;
-    fs::write(dir.join("metadata.json"), generate_metadata_json(&program))?;
+    fs::write(dir.join("coremldata.bin"), generate_coremldata_bin(program))?;
+    fs::write(dir.join("metadata.json"), generate_metadata_json(program))?;
 
     let analytics_dir = dir.join("analytics");
     fs::create_dir_all(&analytics_dir)?;
@@ -171,18 +227,14 @@ pub fn compile_to_dir(
         generate_analytics_bin(),
     )?;
 
-    if let Some(w) = weights {
-        let weights_dir = dir.join("weights");
-        fs::create_dir_all(&weights_dir)?;
-        fs::write(weights_dir.join("weights.bin"), w)?;
-    }
+    weights::write_files(dir, files)?;
 
     Ok(CompileStats {
         input_bytes: protobuf.len(),
         output_bytes: bytes_written,
-        operation_count: count_operations(&program),
-        const_count: count_consts(&program),
-        largest_const_elements: largest_const(&program),
+        operation_count: count_operations(program),
+        const_count: count_consts(program),
+        largest_const_elements: largest_const(program),
     })
 }
 

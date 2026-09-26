@@ -56,14 +56,23 @@ def binding(argument, name):
     return message(2, text(1, argument) + message(2, message(1, text(1, name))))
 
 
-def source_model():
-    blob = text(1, "@model_path/weights/weights.bin") + scalar(2, 64)
+def source_model(path="weights/weights.bin", second_path=None):
+    blob = text(1, "@model_path/" + path) + scalar(2, 64)
     value = message(2, tensor_type([4])) + message(5, blob)
     constant = text(1, "const") + message(3, named_type("weight", [4]))
     constant += message(5, text(1, "val") + message(2, value))
     add = text(1, "add") + binding("x", "input") + binding("y", "weight")
-    add += message(3, named_type("output", [None, 4]))
-    block = text(2, "output") + message(3, constant) + message(3, add)
+    add += message(3, named_type("sum" if second_path else "output", [None, 4]))
+    operations = message(3, constant) + message(3, add)
+    if second_path:
+        blob = text(1, "@model_path/" + second_path) + scalar(2, 64)
+        value = message(2, tensor_type([4])) + message(5, blob)
+        constant = text(1, "const") + message(3, named_type("second", [4]))
+        constant += message(5, text(1, "val") + message(2, value))
+        add = text(1, "add") + binding("x", "sum") + binding("y", "second")
+        add += message(3, named_type("output", [None, 4]))
+        operations += message(3, constant) + message(3, add)
+    block = text(2, "output") + operations
     function = message(1, named_type("input", [None, 4])) + text(2, "CoreML7")
     function += message(3, text(1, "CoreML7") + message(2, block))
     program = scalar(1, 1) + message(2, text(1, "main") + message(2, function))
@@ -72,18 +81,34 @@ def source_model():
     return scalar(1, 9) + message(2, description) + message(502, program)
 
 
-def weight_blob():
+def weight_blob(values=(2, -3, 5, -7)):
     result = bytearray(192)
     struct.pack_into("<II", result, 0, 1, 2)  # one entry, version 2
     struct.pack_into("<IIQQ", result, 64, 0xDEADBEEF, 2, 16, 128)
-    struct.pack_into("<4f", result, 128, 2, -3, 5, -7)
+    struct.pack_into("<4f", result, 128, *values)
     return bytes(result)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="verify committed sources without writing")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="verify committed sources without writing")
+    mode.add_argument("--runtime-packages", type=Path, help="generate named/multiple-blob runtime inputs in a scratch directory")
     args = parser.parse_args()
+    if args.runtime_packages:
+        for name, first, second in [
+            ("named", "weights/weight.bin", None),
+            ("multiple", "weights/weight.bin", "weights/layer/second.bin"),
+        ]:
+            root = args.runtime_packages / (name + ".mlpackage") / "Data/com.apple.CoreML"
+            files = [("model.mlmodel", source_model(first, second)), (first, weight_blob())]
+            if second:
+                files.append((second, weight_blob((1, 4, -2, 3))))
+            for relative, data in files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        return
     root = Path(__file__).parent / "flexible-weighted-legacy"
     for relative, data in [("input.mlmodel", source_model()), ("weights/weights.bin", weight_blob())]:
         path = root / relative

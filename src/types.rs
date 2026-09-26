@@ -146,8 +146,8 @@ impl Default for MILTensorData {
 }
 
 /// An external-weights reference. CoreML MLProgram uses this for non-scalar
-/// constants: the `filename` is always `"@model_path/weights/weights.bin"` in
-/// practice, and `offset` is the byte offset into that file for this tensor.
+/// constants: `filename` is relative to `@model_path/` (for example,
+/// `weights/weight.bin`), and `offset` is the byte offset into that file.
 #[derive(Debug, Clone)]
 pub struct MILBlobRef {
     pub filename: String,

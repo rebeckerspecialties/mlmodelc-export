@@ -14,6 +14,7 @@
 //! The wire layout of `coremldata.bin` matches Apple `coremlc` 3520.x
 //! byte-for-byte for the small models we've validated.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -31,6 +32,9 @@ pub struct MlmodelcBundle {
     /// Mirror of the input `weights_data`, written to `weights/weights.bin`
     /// when present. None for graphs without external weights.
     pub weights_bin: Option<Vec<u8>>,
+    /// Additional external weights keyed by bundle-relative filename. The
+    /// legacy `weights/weights.bin` entry stays in `weights_bin`.
+    pub weight_files: BTreeMap<String, Vec<u8>>,
 }
 
 impl MlmodelcBundle {
@@ -38,7 +42,22 @@ impl MlmodelcBundle {
     /// missing parents. Always overwrites if files already exist.
     pub fn write_to_dir(&self, directory: impl AsRef<Path>) -> io::Result<()> {
         let dir = directory.as_ref();
-        fs::create_dir_all(dir)?;
+        for path in self.weight_files.keys() {
+            crate::weights::validate_path(path).map_err(io::Error::other)?;
+            if path == "weights/weights.bin" && self.weights_bin.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate weights/weights.bin",
+                ));
+            }
+        }
+        let legacy_path = "weights/weights.bin".to_owned();
+        crate::weights::prepare_directory(
+            dir,
+            self.weight_files
+                .keys()
+                .chain(self.weights_bin.as_ref().map(|_| &legacy_path)),
+        )?;
         fs::write(dir.join("model.mil"), &self.model_mil)?;
         fs::write(dir.join("coremldata.bin"), &self.coremldata_bin)?;
         fs::write(dir.join("metadata.json"), &self.metadata_json)?;
@@ -55,12 +74,16 @@ impl MlmodelcBundle {
             fs::create_dir_all(&weights_dir)?;
             fs::write(weights_dir.join("weights.bin"), weights)?;
         }
+        crate::weights::write_files(dir, &self.weight_files)?;
         Ok(())
     }
 }
 
 /// Build the four-file bundle from a decoded `MILProgram` and the MIL text
 /// produced by [`crate::emitter::emit`].
+///
+/// This low-level constructor does not resolve assets. Prefer
+/// [`crate::compile_to_bundle_with_weight_files`] for validated assembly.
 pub fn build_bundle(
     program: &MILProgram,
     model_mil: Vec<u8>,
@@ -72,6 +95,7 @@ pub fn build_bundle(
         metadata_json: generate_metadata_json(program),
         analytics_coremldata_bin: generate_analytics_bin(),
         weights_bin,
+        weight_files: BTreeMap::new(),
     }
 }
 

@@ -194,7 +194,14 @@ fn constexpr_parameters_remain_sorted_typed_attributes() {
     let text = compile_to_text(&protobuf).unwrap().mil_text;
     assert!(text.contains(expected), "{text}");
     assert_eq!(
-        compile_to_bundle(&protobuf, None).unwrap().model_mil,
+        compile_to_bundle(
+            &protobuf,
+            Some(include_bytes!(
+                "fixtures/quantized-constexpr/weights/weights.bin"
+            ))
+        )
+        .unwrap()
+        .model_mil,
         text.as_bytes()
     );
 }
