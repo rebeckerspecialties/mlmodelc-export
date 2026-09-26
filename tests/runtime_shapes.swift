@@ -109,6 +109,34 @@ func run() throws {
             }
         }
     }
+    // Generate tiny source packages with nondefault and multiple blob names.
+    // No coremltools dependency or precompiled model is used.
+    let generate = Process()
+    generate.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    generate.arguments = ["python3", "-B", root.appendingPathComponent("generate_weighted.py").path,
+                          "--runtime-packages", temporary.path]
+    try generate.run()
+    generate.waitUntilExit()
+    try require(generate.terminationStatus == 0, "weight fixture generation failed")
+    for name in ["named", "multiple"] {
+        let bundle = temporary.appendingPathComponent(name + ".mlmodelc")
+        let compile = Process()
+        compile.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
+        compile.arguments = [temporary.appendingPathComponent(name + ".mlpackage").path, bundle.path]
+        try compile.run()
+        compile.waitUntilExit()
+        try require(compile.terminationStatus == 0, "named-weight export failed")
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .cpuOnly
+        let model = try MLModel(contentsOf: bundle, configuration: configuration)
+        let weights = name == "multiple" ? [3, 1, 3, -4] : [2, -3, 5, -7]
+        for count in [1, 4, 2, 1] {
+            let input = (0..<(count * 4)).map { $0 - 8 }
+            try predict(model, ["input": array([count, 4], input)], shape: [count, 4],
+                        values: input.enumerated().map { $0.element + weights[$0.offset % 4] })
+            predictions += 1
+        }
+    }
     print("PASS: \(predictions) exact predictions after local Rust compilation")
 }
 try run()

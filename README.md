@@ -77,6 +77,30 @@ mlmodelc-export model.mlmodel ./model.mlmodelc
 Useful for CI / build pipelines where you want a runnable bundle without
 depending on a macOS host with Xcode installed.
 
+### External weights
+
+The CLI discovers every referenced blob relative to the source `.mlmodel`,
+including the model inside a `.mlpackage`. It preserves filenames, offsets and
+bytes: `weights/weight.bin`, `weights/weights.bin` and multiple/nested files are
+supported. `--weights PATH` overrides a single referenced file; models with
+multiple files must provide their named assets. Missing files, out-of-file
+reference offsets and unsafe paths fail before bundle emission.
+
+Library callers can keep using `compile_to_bundle` / `compile_to_dir` for one
+blob. For multiple blobs, use `referenced_weight_paths` to discover the relative
+paths and supply a `BTreeMap<String, Vec<u8>>` to
+`compile_to_bundle_with_weight_files` / `compile_to_dir_with_weight_files`.
+The streaming API borrows those buffers; only MIL emission is streamed, not
+source weight loading. In-memory bundles retain the legacy `weights_bin` field
+for `weights/weights.bin` and use `weight_files` for other names. Code constructing
+`MlmodelcBundle` directly must initialize the additional map.
+
+This validates asset presence and reference offsets, not the blob's internal
+format. Source-package auto-discovery cannot follow symlinks outside the model
+directory, and bundle writes reject existing destination symlinks. As before,
+callers must not concurrently modify source/output directories during export;
+filesystem write failures are not an atomic directory transaction.
+
 ## On-device Validation
 
 This crate originated as a Swift package (`MILTextCompiler`) inside the
@@ -154,13 +178,16 @@ swift tests/runtime_shapes.swift target/release/mlmodelc-export tests/fixtures
 ```
 
 This compiles the checked-in protobufs through the Rust exporter before loading
-them with CoreML. It does not load the precompiled golden references. The 28
+them with CoreML. It does not load the precompiled golden references. The 36
 exact predictions include a legacy single-function model with external weights,
 growing and shrinking its input on the same loaded model. Its small source
 fixture and independent expected values need no model download. These macOS
 runtime checks do not substitute for physical iOS/watchOS validation. Separate
 exact checks cover FP16 subnormal constants cast to FP32 and int8 compressed
 weights with typed dequantization parameters.
+The runtime suite also generates single- and multiple-blob packages with
+`weight.bin` and nested filenames, checking exact predictions through `1→4→2→1`
+input resizing after exporting without `--weights` or manual file copying.
 
 For large dense Float32 constants (>10⁵ elements) the streaming path uses an
 allocation-free hex-float byte formatter (see

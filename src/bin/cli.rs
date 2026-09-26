@@ -1,11 +1,10 @@
 //! `mlmodelc-export` CLI — compile a `.mlmodel` (or `.mlpackage`) into a
 //! `.mlmodelc` bundle without Apple's `coremlc`.
 
-use std::fs;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
 use clap::Parser;
-use mlmodelc_export::compile_to_dir;
+use mlmodelc_export::{compile_to_dir, compile_to_dir_with_weight_files, referenced_weight_paths};
 
 #[derive(Parser, Debug)]
 #[command(name = "mlmodelc-export")]
@@ -20,9 +19,9 @@ struct Args {
     /// inside are overwritten.
     output: PathBuf,
 
-    /// Optional path to an external `weights.bin` to copy into
-    /// `<output>/weights/weights.bin`. Defaults to auto-detection inside
-    /// `.mlpackage` inputs.
+    /// Supply the model's single external weight file explicitly. Its referenced
+    /// filename is preserved. Otherwise all referenced files are read relative
+    /// to the model inside the package, or alongside a raw `.mlmodel`.
     #[arg(long)]
     weights: Option<PathBuf>,
 }
@@ -36,8 +35,36 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let (model_bytes, weights_bytes) = read_input(&args.input, args.weights.as_deref())?;
-    let stats = compile_to_dir(&model_bytes, weights_bytes.as_deref(), &args.output)?;
+    let model = if args.input.is_dir() {
+        args.input.join("Data/com.apple.CoreML/model.mlmodel")
+    } else {
+        args.input
+    };
+    let model_bytes = fs::read(&model)?;
+    let stats = if let Some(path) = args.weights {
+        compile_to_dir(&model_bytes, Some(&fs::read(path)?), &args.output)?
+    } else {
+        let root = model
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()?;
+        let mut files = BTreeMap::new();
+        for relative in referenced_weight_paths(&model_bytes)? {
+            let source = root.join(&relative).canonicalize().map_err(|error| {
+                io::Error::new(error.kind(), format!("external weight {relative}: {error}"))
+            })?;
+            if !source.starts_with(&root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("external weight escapes model directory: {relative}"),
+                )
+                .into());
+            }
+            files.insert(relative, fs::read(source)?);
+        }
+        compile_to_dir_with_weight_files(&model_bytes, &files, &args.output)?
+    };
     eprintln!(
         "wrote {} ({} ops, {} consts, MIL {} bytes)",
         args.output.display(),
@@ -46,34 +73,4 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         stats.output_bytes
     );
     Ok(())
-}
-
-fn read_input(
-    input: &std::path::Path,
-    explicit_weights: Option<&std::path::Path>,
-) -> std::io::Result<(Vec<u8>, Option<Vec<u8>>)> {
-    if input.is_dir() {
-        let model = input
-            .join("Data")
-            .join("com.apple.CoreML")
-            .join("model.mlmodel");
-        let model_bytes = fs::read(&model)?;
-        if let Some(weights_path) = explicit_weights {
-            return Ok((model_bytes, Some(fs::read(weights_path)?)));
-        }
-        let weights_path = input
-            .join("Data")
-            .join("com.apple.CoreML")
-            .join("weights")
-            .join("weights.bin");
-        let weights_bytes = if weights_path.exists() {
-            Some(fs::read(&weights_path)?)
-        } else {
-            None
-        };
-        return Ok((model_bytes, weights_bytes));
-    }
-    let model_bytes = fs::read(input)?;
-    let weights_bytes = explicit_weights.map(fs::read).transpose()?;
-    Ok((model_bytes, weights_bytes))
 }
