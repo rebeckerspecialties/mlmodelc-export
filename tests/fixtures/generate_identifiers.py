@@ -20,7 +20,7 @@ def source_model(invalid=False):
         "rustnn_escaped_727573746e6e5f657363617065645f37333734363137343635",
         "rustnn_escaped_706173742e6b6579",
     ]
-    outputs = ["rustnn_escaped_72657475726e", "output"]
+    outputs = ["rustnn_escaped_74656e736f72", "output"]  # tensor
     add = text(1, "add") + binding("x", inputs[0]) + binding("y", inputs[1])
     add += message(3, named_type(outputs[0], [4]))
     relu = text(1, "relu") + binding("x", inputs[2])

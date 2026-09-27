@@ -5,7 +5,7 @@ const INPUTS: [&str; 3] = [
     "rustnn_escaped_727573746e6e5f657363617065645f37333734363137343635", // literal encoded prefix
     "rustnn_escaped_706173742e6b6579", // past.key
 ];
-const OUTPUTS: [&str; 2] = ["rustnn_escaped_72657475726e", "output"];
+const OUTPUTS: [&str; 2] = ["rustnn_escaped_74656e736f72", "output"]; // tensor
 
 fn varint(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::new();

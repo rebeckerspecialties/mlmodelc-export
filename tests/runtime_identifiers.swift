@@ -57,7 +57,7 @@ func run() throws {
         "rustnn_escaped_727573746e6e5f657363617065645f37333734363137343635",
         "rustnn_escaped_706173742e6b6579",
     ]
-    let outputs = ["rustnn_escaped_72657475726e", "output"]
+    let outputs = ["rustnn_escaped_74656e736f72", "output"] // tensor
     try require(Set(model.modelDescription.inputDescriptionsByName.keys) == Set(names), "input bindings changed")
     try require(Set(model.modelDescription.outputDescriptionsByName.keys) == Set(outputs), "output bindings changed")
     var checked = 0
