@@ -373,7 +373,23 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         ));
     }
     json.push_str("    \"generatedClassName\" : \"model\",\n");
-    json.push_str("    \"userDefinedMetadata\" : {\n\n    },\n");
+    json.push_str("    \"userDefinedMetadata\" : {\n");
+    if description.user_defined_metadata.is_empty() {
+        json.push('\n');
+    } else {
+        for (index, (key, value)) in description.user_defined_metadata.iter().enumerate() {
+            if index != 0 {
+                json.push_str(",\n");
+            }
+            json.push_str(&format!(
+                "      {} : {}",
+                json_string(key),
+                json_string(value)
+            ));
+        }
+        json.push('\n');
+    }
+    json.push_str("    },\n");
     json.push_str("    \"method\" : \"predict\"\n");
     json.push_str("  }\n");
     json.push(']');

@@ -2,21 +2,28 @@ use mlmodelc_export::{
     compile_to_bundle, compile_to_bundle_with_weight_files, compile_to_dir,
     compile_to_dir_with_weight_files, referenced_weight_paths,
 };
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const WEIGHTS: &[u8] = include_bytes!("fixtures/flexible-weighted-legacy/weights/weights.bin");
 
 struct Scratch(PathBuf);
+static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 impl Scratch {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "mlmodelc-assets-{}-{}",
+            "mlmodelc-assets-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)

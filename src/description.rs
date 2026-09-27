@@ -4,6 +4,7 @@
 //! MIL's FlexibleShapeInformation annotation and the human-readable schema.
 
 use crate::pb_reader::{PBReader, read_packed_varints};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShapeFlexibility {
@@ -51,6 +52,7 @@ pub(crate) struct ModelDescription {
     pub functions: Vec<FunctionDescription>,
     pub default_function: String,
     pub has_metadata: bool,
+    pub user_defined_metadata: BTreeMap<String, String>,
 }
 
 impl ModelDescription {
@@ -73,7 +75,7 @@ impl ModelDescription {
                 21 => result.default_function = reader.read_string(),
                 100 => {
                     result.has_metadata = true;
-                    reader.skip(wire);
+                    decode_metadata(reader.read_length_delimited(), &mut result);
                 }
                 _ => reader.skip(wire),
             }
@@ -86,6 +88,28 @@ impl ModelDescription {
             (name == "main").then_some(&self.main)
         } else {
             self.functions.iter().find(|function| function.name == name)
+        }
+    }
+}
+
+fn decode_metadata(data: &[u8], description: &mut ModelDescription) {
+    let mut reader = PBReader::new(data);
+    while let Some((field, wire)) = reader.read_tag() {
+        if field == 100 {
+            // Metadata.userDefined is a protobuf map<string, string>. Preserve
+            // generic producer metadata; interpreting it belongs to callers.
+            let mut entry = PBReader::new(reader.read_length_delimited());
+            let (mut key, mut value) = (String::new(), String::new());
+            while let Some((field, wire)) = entry.read_tag() {
+                match field {
+                    1 => key = entry.read_string(),
+                    2 => value = entry.read_string(),
+                    _ => entry.skip(wire),
+                }
+            }
+            description.user_defined_metadata.insert(key, value);
+        } else {
+            reader.skip(wire);
         }
     }
 }

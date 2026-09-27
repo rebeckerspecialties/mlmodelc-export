@@ -155,7 +155,8 @@ verified against `xcrun coremlc compile` (Xcode 26.4, `coremlc` 3520.4.1):
 
 - `model.mil` byte-identical except for the `buildInfo` producer string
 - `coremldata.bin` byte-identical (source ModelDescription and per-function trailers)
-- `metadata.json` I/O schemas, shape constraints and function selection match
+- `metadata.json` I/O schemas, shape constraints, function selection and
+  producer-defined metadata are preserved
 
 Ranged flexible shapes preserve unknown MIL extents as `?`, together with the
 source default shapes and bounds. Literal zero remains a fixed empty extent;
@@ -163,6 +164,19 @@ this does not imply that every CoreML operation can predict with empty tensors.
 Both single-function and multi-function descriptions are retained, including a
 non-first default function and descriptions larger than 255 bytes. Additional
 reference fixtures were captured with coremlc 3520.5.1 and 3600.25.1 (Xcode 27).
+
+User-defined metadata survives in both `coremldata.bin` and `metadata.json`.
+This includes producer annotations used to interpret normalized feature names;
+the exporter preserves those names and does not invent its own encoding policy.
+On macOS 15+, check exact predictions and runtime metadata with:
+
+```sh
+swift tests/runtime_identifiers.swift target/release/mlmodelc-export tests/fixtures/generate_identifiers.py
+```
+
+Append `--check-invalid` to also reproduce the loader rejection of an unescaped
+`state` input on affected CoreML versions. CI requires the normalized positive
+case, without requiring future runtimes to reject the negative control.
 
 Enumerated input shapes, variable-rank tensors and variadic dimensions currently
 return an explicit unsupported-format error instead of emitting an invalid model.
