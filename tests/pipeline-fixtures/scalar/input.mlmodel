@@ -1,0 +1,62 @@
+	)
+
+input	*
+†ÄR
+result	*
+†Ä“©
+»	*
+
+input	*
+†ÄR
+rounded	*
+êÄ≤ñë
+mainà
+
+input
+
+
+CoreML7f
+CoreML7[roundedP
+cast
+x	
+
+input
+dtype
+
+
+
+"
+fp16
+rounded
+
+
+
+
+À	+
+
+rounded	*
+êÄR
+result	*
+†Ä≤òì
+mainä
+
+rounded
+
+
+
+CoreML7f
+CoreML7[resultQ
+cast
+x
+	
+rounded
+dtype
+
+
+
+"
+fp32
+result
+
+
+stage0stage1

@@ -35,6 +35,16 @@ pub struct MlmodelcBundle {
     /// Additional external weights keyed by bundle-relative filename. The
     /// legacy `weights/weights.bin` entry stays in `weights_bin`.
     pub weight_files: BTreeMap<String, Vec<u8>>,
+    /// Present for a Pipeline wrapper, whose MIL programs live in child bundles.
+    pub pipeline: Option<PipelineBundle>,
+}
+
+/// Children and parameter names of an exported CoreML Pipeline.
+#[derive(Debug, Clone)]
+pub struct PipelineBundle {
+    pub model_names_bin: Vec<u8>,
+    /// Each entry contains the child bundle and its references to shared assets.
+    pub models: Vec<(MlmodelcBundle, Vec<String>)>,
 }
 
 impl MlmodelcBundle {
@@ -58,7 +68,11 @@ impl MlmodelcBundle {
                 .keys()
                 .chain(self.weights_bin.as_ref().map(|_| &legacy_path)),
         )?;
-        fs::write(dir.join("model.mil"), &self.model_mil)?;
+        if let Some(pipeline) = &self.pipeline {
+            crate::pipeline::prepare_children(dir, pipeline)?;
+        } else {
+            fs::write(dir.join("model.mil"), &self.model_mil)?;
+        }
         fs::write(dir.join("coremldata.bin"), &self.coremldata_bin)?;
         fs::write(dir.join("metadata.json"), &self.metadata_json)?;
 
@@ -75,6 +89,16 @@ impl MlmodelcBundle {
             fs::write(weights_dir.join("weights.bin"), weights)?;
         }
         crate::weights::write_files(dir, &self.weight_files)?;
+        if let Some(pipeline) = &self.pipeline {
+            let names = dir.join("modelNames");
+            fs::create_dir_all(&names)?;
+            fs::write(names.join("coremldata.bin"), &pipeline.model_names_bin)?;
+            for (index, (model, paths)) in pipeline.models.iter().enumerate() {
+                let child = dir.join(format!("model{index}"));
+                model.write_to_dir(&child)?;
+                crate::pipeline::link_weights(dir, &child, paths)?;
+            }
+        }
         Ok(())
     }
 }
@@ -96,6 +120,7 @@ pub fn build_bundle(
         analytics_coremldata_bin: generate_analytics_bin(),
         weights_bin,
         weight_files: BTreeMap::new(),
+        pipeline: None,
     }
 }
 
@@ -381,7 +406,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.into_bytes()
 }
 
-fn schema_list(
+pub(crate) fn schema_list(
     entries: &[(String, MILType)],
     features: Option<&[FeatureDescription]>,
     indent: &str,
@@ -518,7 +543,7 @@ fn json_string(text: &str) -> String {
     result
 }
 
-fn format_data_type_for_meta(dt: MILDataType) -> &'static str {
+pub(crate) fn format_data_type_for_meta(dt: MILDataType) -> &'static str {
     match dt {
         MILDataType::Float32 => "Float32",
         MILDataType::Float16 => "Float16",
@@ -530,7 +555,7 @@ fn format_data_type_for_meta(dt: MILDataType) -> &'static str {
     }
 }
 
-fn opset_prefix(opset: &str) -> &'static str {
+pub(crate) fn opset_prefix(opset: &str) -> &'static str {
     match opset {
         "CoreML8" => "Ios18",
         "CoreML7" => "Ios17",
@@ -540,7 +565,7 @@ fn opset_prefix(opset: &str) -> &'static str {
     }
 }
 
-fn availability_for_spec(spec: i64) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn availability_for_spec(spec: i64) -> Vec<(&'static str, &'static str)> {
     // Key order matches Apple's coremlc 3520.x output exactly: macOS, tvOS,
     // visionOS, watchOS, iOS, macCatalyst. JSON wouldn't care about order
     // semantically, but byte-exact tooling comparisons (and our own golden

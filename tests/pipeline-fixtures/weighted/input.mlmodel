@@ -1,0 +1,106 @@
+	?
+
+input	*
+†ÄR
+rounded	*
+êÄR
+result	*
+†Ä“È
+‰	*
+
+input	*
+†ÄR
+rounded	*
+êÄ≤≤≠
+main§
+
+input
+
+
+CoreML7Å
+CoreML7ırounded\
+const
+weights
+
+
+*:
+val3
+
+
+*#
+@model_path/weights/weights.bin@<
+add
+y
+	
+weights
+x	
+
+input
+sum
+
+
+N
+cast
+dtype
+
+
+
+"
+fp16
+x
+
+sum
+rounded
+
+
+
+
+Ô	+
+
+rounded	*
+êÄR
+result	*
+†Ä≤º∑
+mainÆ
+
+rounded
+
+
+
+CoreML7â
+CoreML7˝result\
+const
+weights
+
+
+*:
+val3
+
+
+*#
+@model_path/weights/weights.bin@R
+cast
+dtype
+
+
+
+"
+fp32
+x
+	
+rounded
+widened
+
+
+A
+add
+x
+	
+widened
+y
+	
+weights
+result
+
+
+stage0stage1
