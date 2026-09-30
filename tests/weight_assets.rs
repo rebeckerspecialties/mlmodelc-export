@@ -10,17 +10,32 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mlmodelc-assets-{}-{}",
-            std::process::id(),
+        Self::with_timestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+        )
+    }
+
+    fn with_timestamp(timestamp: u128) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mlmodelc-assets-{}-{}-{}",
+            std::process::id(),
+            timestamp,
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
+}
+
+#[test]
+fn scratch_directories_are_unique_for_equal_timestamps() {
+    let first = Scratch::with_timestamp(42);
+    let second = Scratch::with_timestamp(42);
+    assert_ne!(first.0, second.0);
 }
 
 impl Drop for Scratch {

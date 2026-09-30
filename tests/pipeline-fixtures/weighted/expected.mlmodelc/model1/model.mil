@@ -1,0 +1,9 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<fp16, [4]> rounded) {
+            tensor<fp32, [4]> weights = const()[val = tensor<fp32, [4]>(BLOBFILE(path = string("@model_path/weights/weights.bin"), offset = uint64(64)))];
+            tensor<fp32, [4]> widened = cast(dtype = string("fp32"), x = rounded);
+            tensor<fp32, [4]> result = add(x = widened, y = weights);
+        } -> (result);
+}
