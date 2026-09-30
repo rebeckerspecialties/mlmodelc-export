@@ -188,8 +188,8 @@ fn bundle_with_files<T: AsRef<[u8]>>(
 /// Streaming variant of [`compile_to_bundle`]: write the bundle directly to
 /// `directory` without materialising the full MIL text in memory. Recommended
 /// for large models on memory-constrained devices.
-/// Pipeline stages borrow the same weight assets. Child references use hard
-/// links when available, with a file-copy fallback on other filesystems.
+/// Pipeline stages reference one shared root asset through generated internal
+/// relative paths, so directory copies do not duplicate weights per child.
 pub fn compile_to_dir(
     protobuf: &[u8],
     weights: Option<&[u8]>,
@@ -201,7 +201,7 @@ pub fn compile_to_dir(
     }
     let program = decode(protobuf)?;
     let files = weights::single_file(&program, weights)?;
-    compile_program_to_dir(protobuf, &program, &files, directory.as_ref())
+    compile_program_to_dir(protobuf, &program, &files, directory.as_ref(), false)
 }
 
 /// Streaming MIL emission with named external files. Like [`compile_to_dir`],
@@ -216,7 +216,7 @@ pub fn compile_to_dir_with_weight_files(
     }
     let program = decode(protobuf)?;
     weights::validate_files(&program, files)?;
-    compile_program_to_dir(protobuf, &program, files, directory.as_ref())
+    compile_program_to_dir(protobuf, &program, files, directory.as_ref(), false)
 }
 
 fn compile_program_to_dir<T: AsRef<[u8]>>(
@@ -224,6 +224,7 @@ fn compile_program_to_dir<T: AsRef<[u8]>>(
     program: &MILProgram,
     files: &BTreeMap<String, T>,
     dir: &Path,
+    pipeline_child: bool,
 ) -> Result<CompileStats, Error> {
     weights::prepare_directory(dir, files.keys())?;
 
@@ -233,7 +234,11 @@ fn compile_program_to_dir<T: AsRef<[u8]>>(
     }
     let file = fs::File::create(&mil_path)?;
     let mut sink = MILOutputSink::streaming(file);
-    emit(program, &mut sink);
+    if pipeline_child {
+        emitter::emit_pipeline_child(program, &mut sink);
+    } else {
+        emit(program, &mut sink);
+    }
     let bytes_written = sink.bytes_written();
     let _ = sink.finalize()?;
 

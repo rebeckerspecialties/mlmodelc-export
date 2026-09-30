@@ -26,6 +26,16 @@ pub fn emit_to_string(program: &MILProgram) -> String {
 
 /// Emit the full MIL text for `program` into the given sink.
 pub fn emit(program: &MILProgram, out: &mut MILOutputSink) {
+    emit_program(program, out, false);
+}
+
+// Call only after validating the source program's asset paths. Pipeline children
+// live exactly one level below the bundle root; they borrow its single assets.
+pub(crate) fn emit_pipeline_child(program: &MILProgram, out: &mut MILOutputSink) {
+    emit_program(program, out, true);
+}
+
+fn emit_program(program: &MILProgram, out: &mut MILOutputSink, shared_root: bool) {
     out.write_str("program(1.3)\n");
     out.write_str("[buildInfo = dict<string, string>(");
     out.write_str("{{\"coremlc-component-MIL\", \"MILTextCompiler\"}, ");
@@ -35,7 +45,7 @@ pub fn emit(program: &MILProgram, out: &mut MILOutputSink) {
 
     let description = ModelDescription::decode(&program.description_data);
     for (name, function) in &program.functions {
-        emit_function(name, function, description.function(name), out);
+        emit_function(name, function, description.function(name), out, shared_root);
     }
 
     out.write_str("}");
@@ -46,6 +56,7 @@ fn emit_function(
     function: &MILFunction,
     description: Option<&FunctionDescription>,
     out: &mut MILOutputSink,
+    shared_root: bool,
 ) {
     let tag = opset_tag(&function.opset);
     out.write_str(&format!("    func {name}<{tag}>("));
@@ -68,7 +79,7 @@ fn emit_function(
     out.write_str(" {\n");
 
     for op in &function.block.operations {
-        emit_operation(op, out);
+        emit_operation(op, out, shared_root);
     }
 
     let outs = function.block.outputs.join(", ");
@@ -116,7 +127,7 @@ fn emit_flexible_shapes(description: &FunctionDescription, out: &mut MILOutputSi
     ));
 }
 
-fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
+fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool) {
     let indent = "            ";
 
     let Some(first_output) = op.outputs.first() else {
@@ -124,7 +135,7 @@ fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
     };
 
     if op.r#type == "const" {
-        emit_const_operation(first_output, &op.attributes, indent, out);
+        emit_const_operation(first_output, &op.attributes, indent, out, shared_root);
         return;
     }
 
@@ -160,7 +171,7 @@ fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
             out.write_str(", ");
         }
         out.write_str(&format!("{key} = "));
-        emit_bindings(bindings, out);
+        emit_bindings(bindings, out, shared_root);
     }
 
     out.write_str(")");
@@ -173,7 +184,7 @@ fn emit_operation(op: &MILOperation, out: &mut MILOutputSink) {
                 out.write_str(", ");
             }
             out.write_str(&format!("{key} = "));
-            emit_typed_literal(value, out);
+            emit_typed_literal(value, out, shared_root);
         }
         out.write_str("]");
     }
@@ -185,6 +196,7 @@ fn emit_const_operation(
     attributes: &[(String, MILValue)],
     indent: &str,
     out: &mut MILOutputSink,
+    shared_root: bool,
 ) {
     let type_str = output.r#type.text_representation();
 
@@ -202,13 +214,13 @@ fn emit_const_operation(
         "{indent}{type_str} {} = const()[val = ",
         output.name
     ));
-    emit_typed_literal(value, out);
+    emit_typed_literal(value, out, shared_root);
     out.write_str("];\n");
 }
 
-fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink) {
+fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink, shared_root: bool) {
     if bindings.len() == 1 {
-        emit_binding(&bindings[0], out);
+        emit_binding(&bindings[0], out, shared_root);
         return;
     }
     out.write_str("(");
@@ -216,22 +228,22 @@ fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink) {
         if i > 0 {
             out.write_str(", ");
         }
-        emit_binding(b, out);
+        emit_binding(b, out, shared_root);
     }
     out.write_str(")");
 }
 
-fn emit_binding(binding: &MILBinding, out: &mut MILOutputSink) {
+fn emit_binding(binding: &MILBinding, out: &mut MILOutputSink, shared_root: bool) {
     match binding {
         MILBinding::Reference(name) => out.write_str(name),
-        MILBinding::Immediate(value) => emit_typed_literal(value, out),
+        MILBinding::Immediate(value) => emit_typed_literal(value, out, shared_root),
     }
 }
 
-fn emit_typed_literal(value: &MILValue, out: &mut MILOutputSink) {
+fn emit_typed_literal(value: &MILValue, out: &mut MILOutputSink, shared_root: bool) {
     if let Some(blob) = &value.blob {
         out.write_str(&format!("{}(", value.r#type.text_representation()));
-        emit_blob_reference(blob, out);
+        emit_blob_reference(blob, out, shared_root);
         out.write_str(")");
         return;
     }
@@ -250,13 +262,23 @@ fn emit_typed_literal(value: &MILValue, out: &mut MILOutputSink) {
     }
 }
 
-fn emit_blob_reference(blob: &MILBlobRef, out: &mut MILOutputSink) {
+fn emit_blob_reference(blob: &MILBlobRef, out: &mut MILOutputSink, shared_root: bool) {
     // Apple's loader expects typed MIL literals here, not raw string/integer.
     // Without the `string(...)` and `uint64(...)` wrappers the parser reports
     // "Type declaration expected here" at the first character after `path = `.
+    let filename = if shared_root {
+        format!(
+            "@model_path/../{}",
+            blob.filename
+                .strip_prefix("@model_path/")
+                .expect("validated asset prefix")
+        )
+    } else {
+        blob.filename.clone()
+    };
     out.write_str(&format!(
         "BLOBFILE(path = string(\"{}\"), offset = uint64({}))",
-        blob.filename, blob.offset
+        filename, blob.offset
     ));
 }
 
@@ -520,5 +542,45 @@ fn opset_tag(opset: &str) -> String {
             }
             opset.to_lowercase()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_relocation_handles_attribute_and_immediate_binding_without_mutation() {
+        let mut program = crate::decode(include_bytes!(
+            "../tests/fixtures/flexible-weighted-legacy/input.mlmodel"
+        ))
+        .unwrap();
+        let value = program.functions[0].1.block.operations[0].attributes[0]
+            .1
+            .clone();
+        let mut binding_op = program.functions[0].1.block.operations[0].clone();
+        binding_op.r#type = "identity".into();
+        binding_op.outputs[0].name = "bound_asset".into();
+        binding_op.attributes.clear();
+        binding_op.inputs = vec![("x".into(), vec![MILBinding::Immediate(value)])];
+        program.functions[0].1.block.operations.push(binding_op);
+        let mut sink = MILOutputSink::in_memory(4096);
+        emit_pipeline_child(&program, &mut sink);
+        let emitted = String::from_utf8(sink.finalize().unwrap()).unwrap();
+        assert_eq!(
+            emitted
+                .matches("@model_path/../weights/weights.bin")
+                .count(),
+            2
+        );
+        assert_eq!(emitted.matches("offset = uint64(64)").count(), 2);
+        assert_eq!(
+            crate::weights::references(&program)
+                .unwrap()
+                .into_keys()
+                .collect::<Vec<_>>(),
+            ["weights/weights.bin"]
+        );
+        assert!(!emit_to_string(&program).contains("@model_path/../"));
     }
 }

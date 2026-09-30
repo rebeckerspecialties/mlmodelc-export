@@ -19,6 +19,7 @@ func validatePipelineBundles(_ root: URL, units: MLComputeUnits = .cpuOnly) thro
         configuration.allowLowPrecisionAccumulationOnGPU = false
         let model = try MLModel(contentsOf: root.appendingPathComponent(name + ".mlmodelc"), configuration: configuration)
         let counts = name == "dynamic" ? [1, 2, 4, 1]
+            : name == "weighted" ? Array(repeating: 4, count: 32)
             : name == "dynamic-boundary" ? [1, 3, 7, 1] : name == "scalar" ? [1] : [4]
         for count in counts {
             let shape = name == "indexed" ? [2, 2] : [count]
@@ -45,6 +46,10 @@ func validatePipelineBundles(_ root: URL, units: MLComputeUnits = .cpuOnly) thro
                 let bits = rounded.dataPointer.assumingMemoryBound(to: UInt16.self)
                 for i in 0..<4 { try check(bits[i * rounded.strides[0].intValue] == Float16(values[i] + weights[i]).bitPattern, "wrong rounded half encoding") }
             }
+            for i in 0..<count {
+                try check(source[i].bitPattern == (name == "dynamic" ? Float(i - 2) : values[i % values.count]).bitPattern,
+                          "\(name) changed input at \(i)")
+            }
             predictions += 1
         }
     }
@@ -67,7 +72,27 @@ func run() throws {
         task.waitUntilExit()
         try check(task.terminationStatus == 0, "Pipeline export failed")
     }
-    print("PASS: \(try validatePipelineBundles(root)) exact Pipeline predictions, including four dynamic sizes")
+    // Match ordinary app staging: Foundation does not preserve hard links when
+    // copying directory trees. Every stage must still find one root asset.
+    let copied = root.appendingPathComponent("installed")
+    try FileManager.default.createDirectory(at: copied, withIntermediateDirectories: true)
+    for name in ["cast", "weighted", "dynamic", "masked", "masked-int32", "scalar", "indexed", "dynamic-boundary"] {
+        try FileManager.default.copyItem(at: root.appendingPathComponent(name + ".mlmodelc"),
+                                        to: copied.appendingPathComponent(name + ".mlmodelc"))
+    }
+    let weighted = copied.appendingPathComponent("weighted.mlmodelc")
+    let assets = FileManager.default.enumerator(at: weighted, includingPropertiesForKeys: nil)!
+        .compactMap { $0 as? URL }.filter { $0.lastPathComponent == "weights.bin" }
+    try check(assets.count == 1, "copy transport duplicated weights per child: \(assets.map(\.path))")
+    try check(assets[0].resolvingSymlinksInPath().path == weighted.appendingPathComponent("weights/weights.bin").resolvingSymlinksInPath().path,
+              "copied asset is not at the shared root: \(assets[0].path)")
+    let originalWeights = try Data(contentsOf: fixtures.appendingPathComponent("weighted/weights.bin"))
+    try check(try Data(contentsOf: assets[0]) == originalWeights, "copy transport changed weights")
+    var predictions = 0
+    for units: MLComputeUnits in [.cpuOnly, .cpuAndGPU, .cpuAndNeuralEngine, .all] {
+        predictions += try validatePipelineBundles(copied, units: units)
+    }
+    print("PASS: \(predictions) exact copied-Pipeline predictions across four policies; one weight asset, repeated outputs, dynamic resizing, unchanged inputs")
 }
 try run()
 #endif
