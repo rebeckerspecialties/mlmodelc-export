@@ -161,8 +161,10 @@ impl Pipeline {
             .programs
             .iter()
             .map(|program| {
+                let mut sink = crate::MILOutputSink::in_memory(4096);
+                crate::emitter::emit_pipeline_child(program, &mut sink);
                 Ok((
-                    crate::build_bundle(program, crate::emit_to_string(program).into_bytes(), None),
+                    crate::build_bundle(program, sink.finalize()?, None),
                     weights::references(program)?.into_keys().collect(),
                 ))
             })
@@ -230,14 +232,14 @@ impl Pipeline {
         };
         for (index, program) in self.programs.iter().enumerate() {
             let child = dir.join(format!("model{index}"));
-            let stats = crate::compile_program_to_dir(&[], program, &empty, &child)?;
+            let stats = crate::compile_program_to_dir(&[], program, &empty, &child, true)?;
             result.output_bytes += stats.output_bytes;
             result.operation_count += stats.operation_count;
             result.const_count += stats.const_count;
             result.largest_const_elements = result
                 .largest_const_elements
                 .max(stats.largest_const_elements);
-            link_weights(dir, &child, &layout.models[index].1)?;
+            remove_child_weights(&child, &layout.models[index].1)?;
         }
         Ok(result)
     }
@@ -426,16 +428,14 @@ pub(crate) fn prepare_children(dir: &Path, pipeline: &PipelineBundle) -> io::Res
     weights::prepare_directory(dir, paths.iter())
 }
 
-pub(crate) fn link_weights(root: &Path, child: &Path, paths: &[String]) -> io::Result<()> {
+pub(crate) fn remove_child_weights(child: &Path, paths: &[String]) -> io::Result<()> {
+    // A re-export may overwrite an older bundle that linked assets into each
+    // child. These validated derived paths are now obsolete; retain only root
+    // assets so ordinary directory copies cannot multiply the weight storage.
     for path in paths {
-        let source = root.join(path);
         let target = child.join(path);
-        fs::create_dir_all(target.parent().expect("weight path parent"))?;
         if target.exists() {
             fs::remove_file(&target)?;
-        }
-        if fs::hard_link(&source, &target).is_err() {
-            fs::copy(&source, &target)?;
         }
     }
     Ok(())

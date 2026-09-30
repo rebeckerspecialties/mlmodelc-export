@@ -77,21 +77,12 @@ fn weighted_pipeline_retains_one_shared_asset() {
     let bundle = compile_to_bundle(&data, Some(&weights)).unwrap();
     let dir = temporary("weighted");
     bundle.write_to_dir(&dir).unwrap();
-    for file in [
-        "weights/weights.bin",
-        "model0/weights/weights.bin",
-        "model1/weights/weights.bin",
-    ] {
-        assert_eq!(fs::read(dir.join(file)).unwrap(), weights);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let root = fs::metadata(dir.join("weights/weights.bin")).unwrap();
-        for child in ["model0", "model1"] {
-            let metadata = fs::metadata(dir.join(child).join("weights/weights.bin")).unwrap();
-            assert_eq!((root.dev(), root.ino()), (metadata.dev(), metadata.ino()));
-        }
+    assert_eq!(fs::read(dir.join("weights/weights.bin")).unwrap(), weights);
+    for child in ["model0", "model1"] {
+        assert!(!dir.join(child).join("weights/weights.bin").exists());
+        let mil = fs::read_to_string(dir.join(child).join("model.mil")).unwrap();
+        assert!(mil.contains("@model_path/../weights/weights.bin"));
+        assert!(!mil.contains("@model_path/weights/weights.bin"));
     }
     assert_eq!(
         fs::read(dir.join("coremldata.bin")).unwrap(),
@@ -140,16 +131,20 @@ fn pipeline_named_assets_resolve_per_child_without_whole_file_clones() {
     let dir = temporary("multiple");
     compile_to_dir_with_weight_files(&data, &files, &dir).unwrap();
     assert_eq!(buffered.pipeline.as_ref().unwrap().models.len(), 2);
-    assert_eq!(
-        fs::read(dir.join("model0/weights/another.bin")).unwrap(),
-        weights
-    );
-    assert_eq!(
-        fs::read(dir.join("model1/weights/weights.bin")).unwrap(),
-        weights
-    );
+    assert_eq!(fs::read(dir.join("weights/another.bin")).unwrap(), weights);
+    assert_eq!(fs::read(dir.join("weights/weights.bin")).unwrap(), weights);
     assert!(!dir.join("model0/weights/weights.bin").exists());
     assert!(!dir.join("model1/weights/another.bin").exists());
+    assert!(
+        fs::read_to_string(dir.join("model0/model.mil"))
+            .unwrap()
+            .contains("@model_path/../weights/another.bin")
+    );
+    assert!(
+        fs::read_to_string(dir.join("model1/model.mil"))
+            .unwrap()
+            .contains("@model_path/../weights/weights.bin")
+    );
     files.remove("weights/another.bin");
     assert!(
         compile_to_bundle_with_weight_files(&data, &files)
@@ -165,6 +160,77 @@ fn pipeline_named_assets_resolve_per_child_without_whole_file_clones() {
             .contains("collides")
     );
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn pipeline_rejects_untrusted_parent_paths_before_internal_relocation() {
+    let fx = fixture("weighted");
+    let mut data = fs::read(fx.join("input.mlmodel")).unwrap();
+    let old = b"@model_path/weights/weights.bin";
+    let new = b"@model_path/../evil/weights.bin";
+    assert_eq!(old.len(), new.len());
+    let offset = data
+        .windows(old.len())
+        .position(|bytes| bytes == old)
+        .unwrap();
+    data[offset..offset + old.len()].copy_from_slice(new);
+    let weights = fs::read(fx.join("weights.bin")).unwrap();
+    let dir = temporary("untrusted-parent");
+    assert!(
+        referenced_weight_paths(&data)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid external weight path")
+    );
+    assert!(
+        compile_to_bundle(&data, Some(&weights))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid external weight path")
+    );
+    assert!(
+        compile_to_dir(&data, Some(&weights), &dir)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid external weight path")
+    );
+    assert!(!dir.exists());
+}
+
+#[test]
+fn pipeline_reexport_removes_only_obsolete_child_assets() {
+    let fx = fixture("weighted");
+    let data = fs::read(fx.join("input.mlmodel")).unwrap();
+    let weights = fs::read(fx.join("weights.bin")).unwrap();
+    for buffered in [false, true] {
+        let dir = temporary(if buffered {
+            "old-buffered"
+        } else {
+            "old-streaming"
+        });
+        for child in ["model0", "model1"] {
+            fs::create_dir_all(dir.join(child).join("weights")).unwrap();
+            fs::write(dir.join(child).join("weights/weights.bin"), &weights).unwrap();
+            fs::write(dir.join(child).join("weights/unrelated.bin"), b"preserve").unwrap();
+        }
+        if buffered {
+            compile_to_bundle(&data, Some(&weights))
+                .unwrap()
+                .write_to_dir(&dir)
+                .unwrap();
+        } else {
+            compile_to_dir(&data, Some(&weights), &dir).unwrap();
+        }
+        assert_eq!(fs::read(dir.join("weights/weights.bin")).unwrap(), weights);
+        for child in ["model0", "model1"] {
+            assert!(!dir.join(child).join("weights/weights.bin").exists());
+            assert_eq!(
+                fs::read(dir.join(child).join("weights/unrelated.bin")).unwrap(),
+                b"preserve"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]

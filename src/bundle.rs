@@ -96,7 +96,7 @@ impl MlmodelcBundle {
             for (index, (model, paths)) in pipeline.models.iter().enumerate() {
                 let child = dir.join(format!("model{index}"));
                 model.write_to_dir(&child)?;
-                crate::pipeline::link_weights(dir, &child, paths)?;
+                crate::pipeline::remove_child_weights(&child, paths)?;
             }
         }
         Ok(())

@@ -14,7 +14,9 @@ The `expected.mlmodelc` directories were captured with Xcode 27's `coremlc
 3600.25.1`, targeting iOS 18. The tests compare wrapper loader data and child-name
 data byte for byte, and compare JSON schemas and operation metadata structurally.
 Child MIL programs remain separate. Native compilation duplicates the weight
-sidecar; our output writes one root asset and links each child to it.
+sidecar; our output writes one root asset and relocates each generated child
+reference to `@model_path/../weights/weights.bin`. Input paths containing `..`
+remain rejected. Copying a bundle with Foundation retains one weight asset.
 
 `dynamic/input.mlmodel` wraps the existing independently generated flexible ReLU
 fixture in a Pipeline. `python3 -B tests/pipeline-fixtures/generate_dynamic.py

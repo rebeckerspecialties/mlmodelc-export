@@ -108,11 +108,12 @@ stages remain separate programs, preserving intermediate FP16 tensor storage
 between an FP32-to-FP16 cast and its consumers. Wrapper and child descriptions
 retain their input defaults, shape ranges and output types.
 
-Streaming export writes each distinct external asset once at the root and
-hard-links child references to it. Filesystems without hard-link support use
-file copies. Buffered bundles retain one owned buffer per distinct asset.
+Export writes each distinct external asset once at the root. Validated child
+references are relocated to that shared root, so ordinary app-directory copies
+retain one asset without depending on hard links. Buffered bundles retain one
+owned buffer per distinct asset.
 Tests check exact cast rounding, both outputs of a weighted two-stage model,
-shared-file identity and repeated dynamic resizing. Empty pipelines, nested
+copied-bundle asset counts and repeated dynamic resizing. Empty pipelines, nested
 pipelines and non-MLProgram children produce explicit errors.
 
 ## On-device Validation
