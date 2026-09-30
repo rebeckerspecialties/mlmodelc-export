@@ -28,6 +28,8 @@ extent and source bounds `[0, 8]`; runtime coverage checks `[1] -> [3] -> [7] ->
 proxy and retains the original input for `where`; `indexed` carries argMax
 indices as int32 into a gather after the FP16 boundary. Their expected values
 are also calculated directly in Swift rather than from a second CoreML model.
+`masked-int32` tests the same mask composition with an int32 proxy between
+programs, matching the current converter's exact boolean transport.
 
 Run `cargo test --test pipelines` and
 `swift tests/runtime_pipelines.swift target/release/mlmodelc-export tests/pipeline-fixtures`.

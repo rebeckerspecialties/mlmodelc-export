@@ -13,7 +13,7 @@ func validatePipelineBundles(_ root: URL, units: MLComputeUnits = .cpuOnly) thro
     let values: [Float] = [1.0003, -1.0003, 1.0007, -1.0007]
     let weights: [Float] = [0.25, -0.25, 0.5, -0.5]
     var predictions = 0
-    for name in ["cast", "weighted", "dynamic", "masked", "scalar", "indexed", "dynamic-boundary"] {
+    for name in ["cast", "weighted", "dynamic", "masked", "masked-int32", "scalar", "indexed", "dynamic-boundary"] {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = units
         configuration.allowLowPrecisionAccumulationOnGPU = false
@@ -33,7 +33,7 @@ func validatePipelineBundles(_ root: URL, units: MLComputeUnits = .cpuOnly) thro
             for i in 0..<count {
                 let expected: Float = name == "dynamic" ? max(0, Float(i - 2))
                     : name == "weighted" ? Float(Float16(values[i] + weights[i])) + weights[i]
-                    : name == "masked" && values[i] < 0 ? values[i]
+                    : name.hasPrefix("masked") && values[i] < 0 ? values[i]
                     : name == "indexed" ? Float(Float16(values[i / 2 * 2]))
                     : Float(Float16(values[i % values.count]))
                 let offset = name == "indexed" ? (i / 2) * result.strides[0].intValue + (i % 2) * result.strides[1].intValue : i * result.strides[0].intValue
@@ -58,7 +58,7 @@ func run() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("pipeline-runtime-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
-    for name in ["cast", "weighted", "dynamic", "masked", "scalar", "indexed", "dynamic-boundary"] {
+    for name in ["cast", "weighted", "dynamic", "masked", "masked-int32", "scalar", "indexed", "dynamic-boundary"] {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
         task.arguments = [fixtures.appendingPathComponent(name + "/input.mlmodel").path, root.appendingPathComponent(name + ".mlmodelc").path]

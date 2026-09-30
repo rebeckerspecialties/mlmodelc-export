@@ -299,7 +299,13 @@ fn flexible_pipeline_keeps_source_bounds_and_unknown_mil_dimensions() {
 
 #[test]
 fn pipeline_proxy_scalar_and_dynamic_interfaces_match_native_metadata() {
-    for name in ["masked", "indexed", "scalar", "dynamic-boundary"] {
+    for name in [
+        "masked",
+        "masked-int32",
+        "indexed",
+        "scalar",
+        "dynamic-boundary",
+    ] {
         let fx = fixture(name);
         let data = fs::read(fx.join("input.mlmodel")).unwrap();
         let bundle = compile_to_bundle(&data, None).unwrap();
@@ -336,6 +342,7 @@ fn pipeline_streaming_and_buffered_bundles_match_every_file() {
         "weighted",
         "dynamic",
         "masked",
+        "masked-int32",
         "scalar",
         "indexed",
         "dynamic-boundary",

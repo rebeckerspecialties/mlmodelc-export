@@ -1,0 +1,10 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<fp32, [4]> input, tensor<int32, [4]> mask_precision_io, tensor<fp16, [4]> rounded) {
+            tensor<uint8, [4]> mask = cast(dtype = string("uint8"), x = mask_precision_io);
+            tensor<fp32, [4]> widened = cast(dtype = string("fp32"), x = rounded);
+            tensor<bool, [4]> mask_bool_5 = cast(dtype = string("bool"), x = mask);
+            tensor<fp32, [4]> result = select(a = widened, b = input, cond = mask_bool_5);
+        } -> (result);
+}
