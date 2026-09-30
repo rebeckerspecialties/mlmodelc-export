@@ -263,7 +263,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     }
     let dominant = counts
         .iter()
-        .max_by_key(|(_, c)| *c)
+        .max_by_key(|(dtype, count)| (**count, std::cmp::Reverse(**dtype as u64)))
         .map(|(k, _)| *k)
         .unwrap_or(MILDataType::Float32);
     let precision = format_data_type_for_meta(dominant);

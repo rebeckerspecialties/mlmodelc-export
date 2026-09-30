@@ -368,3 +368,26 @@ fn pipeline_streaming_and_buffered_bundles_match_every_file() {
         fs::remove_dir_all(streaming).unwrap();
     }
 }
+
+#[test]
+fn child_metadata_is_deterministic_when_precision_counts_tie() {
+    let data = fs::read(fixture("indexed").join("input.mlmodel")).unwrap();
+    let mut metadata = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        let bundle = compile_to_bundle(&data, None).unwrap();
+        metadata.insert(
+            bundle
+                .pipeline
+                .unwrap()
+                .models
+                .into_iter()
+                .map(|(model, _)| model.metadata_json)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        metadata.len(),
+        1,
+        "repeated exports selected different tied precisions"
+    );
+}
