@@ -542,7 +542,7 @@ fn schema_entry(
     s
 }
 
-fn json_string(text: &str) -> String {
+pub(crate) fn json_string(text: &str) -> String {
     let mut result = String::from("\"");
     for ch in text.chars() {
         match ch {
