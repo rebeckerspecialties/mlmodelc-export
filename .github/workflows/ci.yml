@@ -67,6 +67,8 @@ jobs:
       - run: cargo test --release
       - name: Check exact results across flexible input shapes
         run: swift tests/runtime_shapes.swift target/release/mlmodelc-export tests/fixtures
+      - name: Check producer metadata and normalized feature bindings
+        run: swift tests/runtime_identifiers.swift target/release/mlmodelc-export tests/fixtures/generate_identifiers.py
       - name: Check exact Pipeline rounding and dynamic shapes
         run: swift tests/runtime_pipelines.swift target/release/mlmodelc-export tests/pipeline-fixtures
       - name: Round-trip fixtures via coremlc (regression sanity check)

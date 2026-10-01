@@ -317,6 +317,114 @@ fn read_varint(data: &[u8], offset: &mut usize) -> u64 {
     }
 }
 
+fn message_fields(data: &[u8], selected: u64) -> Vec<&[u8]> {
+    let mut offset = 0;
+    let mut result = Vec::new();
+    while offset < data.len() {
+        let tag = read_varint(data, &mut offset);
+        match tag & 7 {
+            0 => {
+                read_varint(data, &mut offset);
+            }
+            2 => {
+                let length = read_varint(data, &mut offset) as usize;
+                if tag >> 3 == selected {
+                    result.push(&data[offset..offset + length]);
+                }
+                offset += length;
+            }
+            _ => panic!("unexpected fixture wire type"),
+        }
+    }
+    result
+}
+
+fn producer_metadata(entries: &[(&str, &str)]) -> Vec<u8> {
+    let entries = entries
+        .iter()
+        .flat_map(|(key, value)| {
+            field(
+                100,
+                &[field(1, key.as_bytes()), field(2, value.as_bytes())].concat(),
+            )
+        })
+        .collect::<Vec<_>>();
+    field(100, &entries)
+}
+
+#[test]
+fn pipeline_preserves_wrapper_and_child_producer_metadata_independently() {
+    let source = fs::read(fixture("cast").join("input.mlmodel")).unwrap();
+    let original_description = message_fields(&source, 2)[0];
+    let children = message_fields(message_fields(&source, 202)[0], 1);
+    let mut child = children[0].to_vec();
+    let mut child_description = message_fields(&child, 2)[0].to_vec();
+    child_description.extend(producer_metadata(&[(
+        "child.only",
+        "do not lift to wrapper",
+    )]));
+    child.extend(field(2, &child_description));
+    let body = [field(1, &child), field(1, children[1])].concat();
+    let mut description = original_description.to_vec();
+    description.extend(producer_metadata(&[
+        ("rustnn.coreml.name_encoding", "hex-v1"),
+        ("rustnn.coreml.input_views", "{\"cache\":[1,4]}"),
+        ("quoted\"key", "line1\nline2\\\t\u{1} café"),
+        ("duplicate", "old"),
+        ("duplicate", "new"),
+    ]));
+    let data = [vec![8, 9], field(2, &description), field(202, &body)].concat();
+    let buffered = compile_to_bundle(&data, None).unwrap();
+    let wrapper: serde_json::Value = serde_json::from_slice(&buffered.metadata_json).unwrap();
+    let user = &wrapper[0]["userDefinedMetadata"];
+    assert_eq!(user["rustnn.coreml.name_encoding"], "hex-v1");
+    assert_eq!(user["rustnn.coreml.input_views"], "{\"cache\":[1,4]}");
+    assert_eq!(user["quoted\"key"], "line1\nline2\\\t\u{1} café");
+    assert_eq!(user["duplicate"], "new");
+    assert_eq!(user.as_object().unwrap().len(), 4);
+
+    let models = &buffered.pipeline.as_ref().unwrap().models;
+    let first: serde_json::Value = serde_json::from_slice(&models[0].0.metadata_json).unwrap();
+    assert_eq!(
+        first[0]["userDefinedMetadata"]["child.only"],
+        "do not lift to wrapper"
+    );
+    assert_eq!(
+        first[0]["userDefinedMetadata"].as_object().unwrap().len(),
+        1
+    );
+    let second: serde_json::Value = serde_json::from_slice(&models[1].0.metadata_json).unwrap();
+    assert_eq!(second[0]["userDefinedMetadata"], serde_json::json!({}));
+
+    let binary = &buffered.coremldata_bin;
+    let target_length = u64::from_le_bytes(binary[28..36].try_into().unwrap()) as usize;
+    let length_offset = 68 + target_length;
+    let length =
+        u64::from_le_bytes(binary[length_offset..length_offset + 8].try_into().unwrap()) as usize;
+    assert_eq!(
+        &binary[length_offset + 8..length_offset + 8 + length],
+        description
+    );
+
+    let dir = temporary("producer-metadata");
+    compile_to_dir(&data, None, &dir).unwrap();
+    assert_eq!(
+        fs::read(dir.join("metadata.json")).unwrap(),
+        buffered.metadata_json
+    );
+    assert_eq!(
+        fs::read(dir.join("coremldata.bin")).unwrap(),
+        buffered.coremldata_bin
+    );
+    for (index, (model, _)) in models.iter().enumerate() {
+        assert_eq!(
+            fs::read(dir.join(format!("model{index}/metadata.json"))).unwrap(),
+            model.metadata_json
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn nested_and_nonprogram_children_fail_before_writing() {
     let ordinary = fs::read(fixture("cast").join("input.mlmodel")).unwrap();

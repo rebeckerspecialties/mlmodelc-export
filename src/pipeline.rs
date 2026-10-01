@@ -3,7 +3,8 @@
 use std::{collections::BTreeMap, fs, io, path::Path};
 
 use crate::bundle::{
-    PipelineBundle, availability_for_spec, format_data_type_for_meta, opset_prefix, schema_list,
+    PipelineBundle, availability_for_spec, format_data_type_for_meta, json_string, opset_prefix,
+    schema_list,
 };
 use crate::description::{FeatureDescription, ModelDescription};
 use crate::pb_reader::PBReader;
@@ -390,7 +391,13 @@ impl Pipeline {
             std::iter::repeat_n("{\"name\":\"MLModelType_mlProgram\"}", self.programs.len())
                 .collect::<Vec<_>>()
                 .join(",");
-        format!("[{{{storage}\"metadataOutputVersion\":\"3.0\",\"outputSchema\":{},\"modelParameters\":[],\"specificationVersion\":{},\"mlProgramOperationTypeHistogram\":{{{hist}}},\"computePrecision\":\"{precision}\",\"isUpdatable\":\"0\",\"stateSchema\":[],\"availability\":{{{avail}}},\"modelType\":{{\"name\":\"MLModelType_pipeline\",\"structure\":[{models}]}},\"userDefinedMetadata\":{{}},\"inputSchema\":{},\"generatedClassName\":\"model\",\"method\":\"predict\"}}]",schema_list(&types(&description.main.outputs),Some(&description.main.outputs),""),self.spec_version,schema_list(&types(&description.main.inputs),Some(&description.main.inputs),"")).into_bytes()
+        let user_metadata = description
+            .user_defined_metadata
+            .iter()
+            .map(|(key, value)| format!("{}:{}", json_string(key), json_string(value)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{{{storage}\"metadataOutputVersion\":\"3.0\",\"outputSchema\":{},\"modelParameters\":[],\"specificationVersion\":{},\"mlProgramOperationTypeHistogram\":{{{hist}}},\"computePrecision\":\"{precision}\",\"isUpdatable\":\"0\",\"stateSchema\":[],\"availability\":{{{avail}}},\"modelType\":{{\"name\":\"MLModelType_pipeline\",\"structure\":[{models}]}},\"userDefinedMetadata\":{{{user_metadata}}},\"inputSchema\":{},\"generatedClassName\":\"model\",\"method\":\"predict\"}}]",schema_list(&types(&description.main.outputs),Some(&description.main.outputs),""),self.spec_version,schema_list(&types(&description.main.inputs),Some(&description.main.inputs),"")).into_bytes()
     }
 }
 
