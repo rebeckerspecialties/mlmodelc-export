@@ -1,0 +1,18 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<int32, [2]> indices, tensor<fp16, [2, 2]> rounded) {
+            tensor<fp32, [2, 2]> widened = cast(dtype = string("fp32"), x = rounded);
+            tensor<int32, [2]> result_idx_i32 = cast(dtype = string("int32"), x = indices);
+            int32 result_gsz = const()[val = int32(2)];
+            int32 result_gszm1 = const()[val = int32(1)];
+            int32 result_gz = const()[val = int32(0)];
+            tensor<bool, [2]> result_gneg = less(x = result_idx_i32, y = result_gz);
+            tensor<int32, [2]> result_gnegi = cast(dtype = string("int32"), x = result_gneg);
+            tensor<int32, [2]> result_goff = mul(x = result_gnegi, y = result_gsz);
+            tensor<int32, [2]> result_gwrap = add(x = result_idx_i32, y = result_goff);
+            tensor<int32, [2]> result_gmx = maximum(x = result_gwrap, y = result_gz);
+            tensor<int32, [2]> result_gcl = minimum(x = result_gmx, y = result_gszm1);
+            tensor<fp32, [2, 2]> result = gather(axis = int32(1), indices = result_gcl, validate_indices = bool(false), x = widened);
+        } -> (result);
+}

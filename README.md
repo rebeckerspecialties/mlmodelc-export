@@ -101,6 +101,21 @@ directory, and bundle writes reject existing destination symlinks. As before,
 callers must not concurrently modify source/output directories during export;
 filesystem write failures are not an atomic directory transaction.
 
+### Pipeline precision boundaries
+
+Flat CoreML Pipelines containing MLPrograms use the same compile APIs. Their
+stages remain separate programs, preserving intermediate FP16 tensor storage
+between an FP32-to-FP16 cast and its consumers. Wrapper and child descriptions
+retain their input defaults, shape ranges and output types.
+
+Export writes each distinct external asset once at the root. Validated child
+references are relocated to that shared root, so ordinary app-directory copies
+retain one asset without depending on hard links. Buffered bundles retain one
+owned buffer per distinct asset.
+Tests check exact cast rounding, both outputs of a weighted two-stage model,
+copied-bundle asset counts and repeated dynamic resizing. Empty pipelines, nested
+pipelines and non-MLProgram children produce explicit errors.
+
 ## On-device Validation
 
 This crate originated as a Swift package (`MILTextCompiler`) inside the

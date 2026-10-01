@@ -47,6 +47,7 @@ mod description;
 mod emitter;
 mod hex_float;
 mod pb_reader;
+mod pipeline;
 mod sink;
 mod types;
 mod weights;
@@ -56,7 +57,7 @@ use std::fs;
 use std::path::Path;
 
 pub use bundle::{
-    MlmodelcBundle, build_bundle, generate_analytics_bin, generate_coremldata_bin,
+    MlmodelcBundle, PipelineBundle, build_bundle, generate_analytics_bin, generate_coremldata_bin,
     generate_metadata_json,
 };
 pub use decoder::{MILDecoderError, decode};
@@ -126,12 +127,16 @@ pub fn compile_to_text(protobuf: &[u8]) -> Result<CompileResult, Error> {
     Ok(CompileResult { mil_text, stats })
 }
 
-/// Compile a CoreML protobuf into a complete `.mlmodelc` bundle in memory.
+/// Compile an MLProgram or a flat Pipeline of MLPrograms into a `.mlmodelc` bundle.
 ///
 /// `weights` supplies the model's single referenced external file, preserving
 /// its filename. Pass `None` for inline-constant models. Missing assets fail
 /// explicitly. Use [`compile_to_bundle_with_weight_files`] for multiple files.
 pub fn compile_to_bundle(protobuf: &[u8], weights: Option<&[u8]>) -> Result<MlmodelcBundle, Error> {
+    if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
+        let files = pipeline.single_file(weights)?;
+        return pipeline.bundle(&files);
+    }
     let program = decode(protobuf)?;
     let files = weights::single_file(&program, weights)?;
     Ok(bundle_with_files(&program, &files))
@@ -140,6 +145,9 @@ pub fn compile_to_bundle(protobuf: &[u8], weights: Option<&[u8]>) -> Result<Mlmo
 /// The sorted, unique external weight paths referenced by a model, relative
 /// to `@model_path/`. Invalid or nonportable paths are rejected.
 pub fn referenced_weight_paths(protobuf: &[u8]) -> Result<Vec<String>, Error> {
+    if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
+        return Ok(pipeline.references()?.into_keys().collect());
+    }
     Ok(weights::references(&decode(protobuf)?)?
         .into_keys()
         .collect())
@@ -152,6 +160,9 @@ pub fn compile_to_bundle_with_weight_files(
     protobuf: &[u8],
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<MlmodelcBundle, Error> {
+    if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
+        return pipeline.bundle(files);
+    }
     let program = decode(protobuf)?;
     weights::validate_files(&program, files)?;
     Ok(bundle_with_files(&program, files))
@@ -177,14 +188,20 @@ fn bundle_with_files<T: AsRef<[u8]>>(
 /// Streaming variant of [`compile_to_bundle`]: write the bundle directly to
 /// `directory` without materialising the full MIL text in memory. Recommended
 /// for large models on memory-constrained devices.
+/// Pipeline stages reference one shared root asset through generated internal
+/// relative paths, so directory copies do not duplicate weights per child.
 pub fn compile_to_dir(
     protobuf: &[u8],
     weights: Option<&[u8]>,
     directory: impl AsRef<Path>,
 ) -> Result<CompileStats, Error> {
+    if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
+        let files = pipeline.single_file(weights)?;
+        return pipeline.write(protobuf.len(), &files, directory.as_ref());
+    }
     let program = decode(protobuf)?;
     let files = weights::single_file(&program, weights)?;
-    compile_program_to_dir(protobuf, &program, &files, directory.as_ref())
+    compile_program_to_dir(protobuf, &program, &files, directory.as_ref(), false)
 }
 
 /// Streaming MIL emission with named external files. Like [`compile_to_dir`],
@@ -194,9 +211,12 @@ pub fn compile_to_dir_with_weight_files(
     files: &BTreeMap<String, Vec<u8>>,
     directory: impl AsRef<Path>,
 ) -> Result<CompileStats, Error> {
+    if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
+        return pipeline.write(protobuf.len(), files, directory.as_ref());
+    }
     let program = decode(protobuf)?;
     weights::validate_files(&program, files)?;
-    compile_program_to_dir(protobuf, &program, files, directory.as_ref())
+    compile_program_to_dir(protobuf, &program, files, directory.as_ref(), false)
 }
 
 fn compile_program_to_dir<T: AsRef<[u8]>>(
@@ -204,6 +224,7 @@ fn compile_program_to_dir<T: AsRef<[u8]>>(
     program: &MILProgram,
     files: &BTreeMap<String, T>,
     dir: &Path,
+    pipeline_child: bool,
 ) -> Result<CompileStats, Error> {
     weights::prepare_directory(dir, files.keys())?;
 
@@ -213,7 +234,11 @@ fn compile_program_to_dir<T: AsRef<[u8]>>(
     }
     let file = fs::File::create(&mil_path)?;
     let mut sink = MILOutputSink::streaming(file);
-    emit(program, &mut sink);
+    if pipeline_child {
+        emitter::emit_pipeline_child(program, &mut sink);
+    } else {
+        emit(program, &mut sink);
+    }
     let bytes_written = sink.bytes_written();
     let _ = sink.finalize()?;
 

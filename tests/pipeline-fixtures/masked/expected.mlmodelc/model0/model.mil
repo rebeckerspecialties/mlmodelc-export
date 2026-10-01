@@ -1,0 +1,11 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios17>(tensor<fp32, [4]> input) {
+            fp32 threshold = const()[val = fp32(0x0p+0)];
+            tensor<bool, [4]> mask_graph_bool = greater(x = input, y = threshold);
+            tensor<uint8, [4]> mask_graph = cast(dtype = string("uint8"), x = mask_graph_bool);
+            tensor<fp16, [4]> rounded = cast(dtype = string("fp16"), x = input);
+            tensor<fp32, [4]> mask = cast(dtype = string("fp32"), x = mask_graph);
+        } -> (mask, rounded);
+}

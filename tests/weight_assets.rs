@@ -16,18 +16,31 @@ static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 impl Scratch {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mlmodelc-assets-{}-{}-{}",
-            std::process::id(),
+        Self::with_timestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
-            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn with_timestamp(timestamp: u128) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "mlmodelc-assets-{}-{}-{}",
+            std::process::id(),
+            timestamp,
+            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
+}
+
+#[test]
+fn scratch_directories_are_unique_for_equal_timestamps() {
+    let first = Scratch::with_timestamp(42);
+    let second = Scratch::with_timestamp(42);
+    assert_ne!(first.0, second.0);
 }
 
 impl Drop for Scratch {
