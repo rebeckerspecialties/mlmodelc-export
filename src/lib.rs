@@ -206,9 +206,11 @@ pub fn compile_to_dir(
 
 /// Streaming MIL emission with named external files. Like [`compile_to_dir`],
 /// weight data is borrowed, not cloned. References are validated before writing.
-pub fn compile_to_dir_with_weight_files(
+/// Values may be slices, memory mappings, or owned buffers; the exporter does
+/// not require a model-sized `Vec<u8>` allocation for mapped assets.
+pub fn compile_to_dir_with_weight_files<T: AsRef<[u8]>>(
     protobuf: &[u8],
-    files: &BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, T>,
     directory: impl AsRef<Path>,
 ) -> Result<CompileStats, Error> {
     if let Some(pipeline) = pipeline::Pipeline::decode(protobuf)? {
@@ -277,7 +279,7 @@ fn count_operations(program: &MILProgram) -> usize {
     program
         .functions
         .iter()
-        .map(|(_, f)| f.block.operations.len())
+        .map(|(_, f)| f.block.all_operations().count())
         .sum()
 }
 
@@ -285,7 +287,7 @@ fn count_consts(program: &MILProgram) -> usize {
     program
         .functions
         .iter()
-        .flat_map(|(_, f)| f.block.operations.iter())
+        .flat_map(|(_, f)| f.block.all_operations())
         .filter(|op| op.r#type == "const")
         .count()
 }
@@ -293,7 +295,7 @@ fn count_consts(program: &MILProgram) -> usize {
 fn largest_const(program: &MILProgram) -> usize {
     let mut largest = 0;
     for (_, f) in &program.functions {
-        for op in &f.block.operations {
+        for op in f.block.all_operations() {
             if op.r#type == "const" {
                 for (k, v) in &op.attributes {
                     if k == "val" {

@@ -224,6 +224,32 @@ allocation-free hex-float byte formatter (see
 the naive `String`-allocating implementation. This was the critical
 optimisation for getting jetsam-safe compile times on arm64_32 watch SoCs.
 
+## Native control flow
+
+Nested MIL `while_loop` and `cond` bodies retain their typed block arguments,
+operations and return values. External weight discovery, bundle relocation and
+metadata also visit nested blocks. This is required when packed weights are
+expanded inside a bounded native loop; dropping a body is not a valid export.
+The decoder rejects more than 64 nested blocks before emission.
+The streaming named-weight API accepts `AsRef<[u8]>` owners, including memory
+mappings, so the caller need not copy each mapped asset into a `Vec<u8>`.
+
+Run the reproducible fixture and exact native runtime checks entirely offline
+with cached Rust dependencies:
+
+```sh
+python3 -B tests/control-flow/generate.py --check
+cargo test --offline --locked
+cargo build --offline --locked --release
+swift tests/runtime_control_flow.swift target/release/mlmodelc-export tests/control-flow
+```
+
+The fixture combines a loop, an inner branch and an Int8 BLOBFILE constant.
+The runtime check uses only final outputs and exercises the requested compute
+policies; policy selection does not establish GPU or Neural Engine placement.
+Exporter support does not by itself establish WebNN numerical conformance or a
+whole-model memory/performance bound. Callers supply the native MIL lowering.
+
 ## License
 
 Dual licensed at your option:

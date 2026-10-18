@@ -124,28 +124,41 @@ fn decode_function(data: &[u8]) -> Result<MILFunction, MILDecoderError> {
 }
 
 fn decode_block(data: &[u8]) -> Result<MILBlock, MILDecoderError> {
+    decode_block_at(data, 0)
+}
+
+fn decode_block_at(data: &[u8], depth: usize) -> Result<MILBlock, MILDecoderError> {
+    if depth > 64 {
+        return Err(MILDecoderError::UnsupportedFormat(
+            "MIL control flow exceeds 64 nested blocks".into(),
+        ));
+    }
     let mut reader = PBReader::new(data);
+    let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut operations = Vec::new();
     while let Some((field, wire)) = reader.read_tag() {
         match field {
+            1 => inputs.push(decode_named_value_type(reader.read_length_delimited())?),
             2 => outputs.push(reader.read_string()),
-            3 => operations.push(decode_operation(reader.read_length_delimited())?),
+            3 => operations.push(decode_operation(reader.read_length_delimited(), depth)?),
             _ => reader.skip(wire),
         }
     }
     Ok(MILBlock {
+        inputs,
         outputs,
         operations,
     })
 }
 
-fn decode_operation(data: &[u8]) -> Result<MILOperation, MILDecoderError> {
+fn decode_operation(data: &[u8], depth: usize) -> Result<MILOperation, MILDecoderError> {
     let mut reader = PBReader::new(data);
     let mut r#type = String::new();
     let mut inputs: Vec<(String, Vec<MILBinding>)> = Vec::new();
     let mut outputs: Vec<MILNamedType> = Vec::new();
     let mut attributes: Vec<(String, MILValue)> = Vec::new();
+    let mut blocks = Vec::new();
 
     while let Some((field, wire)) = reader.read_tag() {
         match field {
@@ -156,6 +169,7 @@ fn decode_operation(data: &[u8]) -> Result<MILOperation, MILDecoderError> {
                 inputs.push((key, decode_argument(&value)?));
             }
             3 => outputs.push(decode_named_value_type(reader.read_length_delimited())?),
+            4 => blocks.push(decode_block_at(reader.read_length_delimited(), depth + 1)?),
             5 => {
                 let entry = reader.read_length_delimited();
                 let (key, value) = decode_map_entry(entry)?;
@@ -167,6 +181,7 @@ fn decode_operation(data: &[u8]) -> Result<MILOperation, MILDecoderError> {
 
     Ok(MILOperation {
         r#type,
+        blocks,
         inputs,
         outputs,
         attributes,

@@ -40,7 +40,7 @@ pub(crate) fn validate_path(path: &str) -> Result<(), Error> {
 pub(crate) fn references(program: &MILProgram) -> Result<BTreeMap<String, u64>, Error> {
     let mut paths = BTreeMap::<String, u64>::new();
     for (_, function) in &program.functions {
-        for operation in &function.block.operations {
+        for operation in function.block.all_operations() {
             let inputs = operation
                 .inputs
                 .iter()
