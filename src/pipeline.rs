@@ -321,7 +321,7 @@ impl Pipeline {
         let mut storage = std::collections::BTreeSet::new();
         for program in &self.programs {
             for (_, function) in &program.functions {
-                for op in &function.block.operations {
+                for op in function.block.all_operations() {
                     if op.r#type != "const" {
                         let name = match op.r#type.as_str() {
                             "select" => "Select".to_owned(),

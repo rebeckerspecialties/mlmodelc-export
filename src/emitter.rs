@@ -128,7 +128,12 @@ fn emit_flexible_shapes(description: &FunctionDescription, out: &mut MILOutputSi
 }
 
 fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool) {
-    let indent = "            ";
+    emit_operation_at(op, out, shared_root, 12);
+}
+
+fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool, depth: usize) {
+    let padding = " ".repeat(depth);
+    let indent = padding.as_str();
 
     let Some(first_output) = op.outputs.first() else {
         return;
@@ -187,6 +192,30 @@ fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool)
             emit_typed_literal(value, out, shared_root);
         }
         out.write_str("]");
+    }
+    for block in &op.blocks {
+        out.write_str("\n");
+        out.write_str(&" ".repeat(depth + 4));
+        out.write_str("(");
+        for (index, input) in block.inputs.iter().enumerate() {
+            if index > 0 {
+                out.write_str(", ");
+            }
+            out.write_str(&format!(
+                "{} {}",
+                input.r#type.text_representation(),
+                input.name
+            ));
+        }
+        out.write_str(") {\n");
+        for child in &block.operations {
+            emit_operation_at(child, out, shared_root, depth + 8);
+        }
+        out.write_str(&format!(
+            "{} }} -> ({})",
+            " ".repeat(depth + 3),
+            block.outputs.join(", ")
+        ));
     }
     out.write_str(";\n");
 }

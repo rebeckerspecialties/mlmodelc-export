@@ -227,7 +227,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     if let Some((_, f)) = main_func {
         let prefix = opset_prefix(&f.opset);
-        for op in &f.block.operations {
+        for op in f.block.all_operations() {
             *hist.entry(format!("{prefix}.{}", op.r#type)).or_insert(0) += 1;
         }
     }
@@ -255,7 +255,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     let mut counts: std::collections::HashMap<MILDataType, usize> =
         std::collections::HashMap::new();
     if let Some((_, f)) = main_func {
-        for op in &f.block.operations {
+        for op in f.block.all_operations() {
             for o in &op.outputs {
                 *counts.entry(o.r#type.data_type).or_insert(0) += 1;
             }
@@ -325,7 +325,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
             ));
             json.push_str("        \"mlProgramOperationTypeHistogram\" : {\n");
             let mut function_hist = std::collections::BTreeMap::<String, usize>::new();
-            for op in &function.block.operations {
+            for op in function.block.all_operations() {
                 *function_hist
                     .entry(format!("{}.{}", opset_prefix(&function.opset), op.r#type))
                     .or_default() += 1;

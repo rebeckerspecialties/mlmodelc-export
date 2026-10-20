@@ -208,6 +208,7 @@ pub enum MILBinding {
 #[derive(Debug, Clone)]
 pub struct MILOperation {
     pub r#type: String,
+    pub blocks: Vec<MILBlock>,
     /// Inputs map: each key maps to one or more bindings (usually one; multi
     /// for concat/repeated values).
     pub inputs: Vec<(String, Vec<MILBinding>)>,
@@ -220,8 +221,28 @@ pub struct MILOperation {
 /// A MIL basic block containing operations and output names.
 #[derive(Debug, Clone, Default)]
 pub struct MILBlock {
+    pub inputs: Vec<MILNamedType>,
     pub outputs: Vec<String>,
     pub operations: Vec<MILOperation>,
+}
+
+impl MILBlock {
+    /// Preorder traversal, including operations in nested control-flow blocks.
+    pub fn all_operations(&self) -> impl Iterator<Item = &MILOperation> {
+        // Keep only pending block iterators, rather than allocating a second
+        // operation-sized collection for each metadata/weight traversal.
+        let mut pending = vec![self.operations.iter()];
+        std::iter::from_fn(move || {
+            loop {
+                let current = pending.last_mut()?;
+                if let Some(op) = current.next() {
+                    pending.extend(op.blocks.iter().rev().map(|block| block.operations.iter()));
+                    return Some(op);
+                }
+                pending.pop();
+            }
+        })
+    }
 }
 
 /// A MIL function with typed inputs, an opset identifier, and a main block.
