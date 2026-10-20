@@ -35,7 +35,7 @@ jobs:
         run: |
           cargo llvm-cov --branch --all-features --json --summary-only \
             --output-path coverage-summary.json
-          cargo llvm-cov report --branch --all-features > coverage-report.txt
+          cargo llvm-cov report --branch > coverage-report.txt
           cat coverage-report.txt
       - name: Enforce the branch-coverage floor
         run: |
