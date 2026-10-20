@@ -1,0 +1,59 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Branch coverage needs `-Z coverage-options=branch`, which is nightly-only, so
+# this job pins a nightly toolchain independently of the stable CI matrix.
+# The gate is deliberately a floor on *branch* coverage, not lines: the crate's
+# correctness risk is in the serialization/decoding decision points, not in
+# straight-line code.
+env:
+  MIN_BRANCH_PERCENT: "80"
+
+jobs:
+  branch-coverage:
+    name: Branch coverage (nightly, >= 80%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: coverage-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Measure line and branch coverage
+        run: |
+          cargo llvm-cov --branch --all-features --json --summary-only \
+            --output-path coverage-summary.json
+          cargo llvm-cov report --branch --all-features > coverage-report.txt
+          cat coverage-report.txt
+      - name: Enforce the branch-coverage floor
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          totals = json.load(open("coverage-summary.json"))["data"][0]["totals"]
+          branches = totals["branches"]
+          lines = totals["lines"]
+          floor = float(os.environ["MIN_BRANCH_PERCENT"])
+          print(f"branches: {branches['covered']}/{branches['count']} = {branches['percent']:.2f}%")
+          print(f"lines:    {lines['covered']}/{lines['count']} = {lines['percent']:.2f}%")
+          if branches["percent"] < floor:
+              print(f"::error::branch coverage {branches['percent']:.2f}% is below the {floor:.0f}% floor")
+              sys.exit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage-summary.json
+            coverage-report.txt
