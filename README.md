@@ -231,6 +231,11 @@ operations and return values. External weight discovery, bundle relocation and
 metadata also visit nested blocks. This is required when packed weights are
 expanded inside a bounded native loop; dropping a body is not a valid export.
 The decoder rejects more than 64 nested blocks before emission.
+The exporter preserves lexical names and captures; it does not validate MIL
+SSA scope, operator types, or control-flow semantics. Callers must supply a valid
+program. The recursive serialization tests cover sibling scopes, ordered
+returns, depth boundaries, and external-asset error handling separately from
+the native runtime fixture.
 The streaming named-weight API accepts `AsRef<[u8]>` owners, including memory
 mappings, so the caller need not copy each mapped asset into a `Vec<u8>`.
 
