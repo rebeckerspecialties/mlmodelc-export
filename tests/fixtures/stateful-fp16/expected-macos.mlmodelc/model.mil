@@ -1,0 +1,10 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3605.1.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios18>(state<tensor<fp16, [1, 4]>> state_0, tensor<fp16, [1, 4]> x) {
+            tensor<fp16, [1, 4]> state_0_read = read_state(input = state_0);
+            tensor<fp16, [1, 4]> next_state_0 = add(x = state_0_read, y = x);
+            tensor<fp16, [1, 4]> y = add(x = next_state_0, y = x);
+            write_state(data = next_state_0, input = state_0);
+        } -> (y);
+}

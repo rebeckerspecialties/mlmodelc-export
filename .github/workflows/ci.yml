@@ -32,6 +32,10 @@ jobs:
         run: python3 tests/fixtures/generate_weighted.py --check
       - name: Verify generated precision fixture sources
         run: python3 -B tests/fixtures/generate_precision.py --check
+      - name: Verify generated model-state fixture sources
+        run: python3 -B tests/fixtures/generate_state.py --check
+      - name: Verify generated blockwise-constant fixture sources
+        run: python3 -B tests/fixtures/generate_blockwise.py --check
       - name: Verify dynamic Pipeline fixture source
         run: python3 -B tests/pipeline-fixtures/generate_dynamic.py --check
       - name: Verify nested control-flow fixture source
@@ -75,6 +79,8 @@ jobs:
         run: swift tests/runtime_pipelines.swift target/release/mlmodelc-export tests/pipeline-fixtures
       - name: Check nested control flow and packed weights
         run: swift tests/runtime_control_flow.swift target/release/mlmodelc-export tests/control-flow
+      - name: Check model state accumulation and blockwise constants
+        run: swift tests/runtime_state.swift target/release/mlmodelc-export tests/fixtures
       - name: Round-trip fixtures via coremlc (regression sanity check)
         # Re-run `xcrun coremlc compile` against each committed input and
         # diff against the committed reference, ignoring lines that

@@ -3,14 +3,13 @@
 use std::{collections::BTreeMap, fs, io, path::Path};
 
 use crate::bundle::{
-    PipelineBundle, availability_for_spec, format_data_type_for_meta, json_string, opset_prefix,
-    schema_list,
+    PipelineBundle, availability_for_spec, blob_values, format_data_type_for_meta, histogram_key,
+    json_string, numeric_precision, precision_text, schema_list,
 };
 use crate::description::{FeatureDescription, ModelDescription};
 use crate::pb_reader::PBReader;
 use crate::{
-    CompileStats, Error, MILBinding, MILDataType, MILProgram, MILType, MlmodelcBundle, decode,
-    weights,
+    CompileStats, Error, MILDataType, MILProgram, MILType, MlmodelcBundle, decode, weights,
 };
 
 pub(crate) struct Pipeline {
@@ -325,29 +324,14 @@ impl Pipeline {
                     if op.r#type != "const" {
                         let name = match op.r#type.as_str() {
                             "select" => "Select".to_owned(),
-                            "reduce_argmax" => {
-                                format!("{}.reduceArgmax", opset_prefix(&function.opset))
-                            }
-                            "reduce_argmin" => {
-                                format!("{}.reduceArgmin", opset_prefix(&function.opset))
-                            }
-                            other => format!("{}.{}", opset_prefix(&function.opset), other),
+                            other => histogram_key(&function.opset, other),
                         };
                         *hist.entry(name).or_default() += 1;
                     }
-                    let inputs = op
-                        .inputs
-                        .iter()
-                        .flat_map(|(_, bindings)| bindings)
-                        .filter_map(|binding| match binding {
-                            MILBinding::Immediate(value) => Some(value),
-                            _ => None,
-                        });
-                    for value in op.attributes.iter().map(|(_, value)| value).chain(inputs) {
-                        if value.blob.is_some() {
-                            storage.insert(format_data_type_for_meta(value.r#type.data_type));
-                        }
-                    }
+                    storage.extend(
+                        blob_values(op)
+                            .map(|value| format_data_type_for_meta(value.r#type.data_type)),
+                    );
                     for output in &op.outputs {
                         if op.r#type != "const"
                             && let Some(precision) = numeric_precision(output.r#type.data_type)
@@ -358,30 +342,15 @@ impl Pipeline {
                 }
             }
         }
-        let precision = match precisions.len() {
-            0 => "Float32".into(),
-            1 => precisions.into_iter().next().unwrap().into(),
-            _ => format!(
-                "Mixed ({})",
-                precisions.into_iter().collect::<Vec<_>>().join(", ")
-            ),
-        };
+        let precision = precision_text(&precisions).unwrap_or_else(|| "Float32".into());
         let hist = hist
             .iter()
             .map(|(name, count)| format!("\"{name}\":{count}"))
             .collect::<Vec<_>>()
             .join(",");
-        let storage = match storage.len() {
-            0 => String::new(),
-            1 => format!(
-                "\"storagePrecision\":\"{}\",",
-                storage.into_iter().next().unwrap()
-            ),
-            _ => format!(
-                "\"storagePrecision\":\"Mixed ({})\",",
-                storage.into_iter().collect::<Vec<_>>().join(", ")
-            ),
-        };
+        let storage = precision_text(&storage)
+            .map(|storage| format!("\"storagePrecision\":\"{storage}\","))
+            .unwrap_or_default();
         let avail = availability_for_spec(self.spec_version)
             .iter()
             .map(|(key, value)| format!("\"{key}\":\"{value}\""))
@@ -399,21 +368,6 @@ impl Pipeline {
             .join(",");
         format!("[{{{storage}\"metadataOutputVersion\":\"3.0\",\"outputSchema\":{},\"modelParameters\":[],\"specificationVersion\":{},\"mlProgramOperationTypeHistogram\":{{{hist}}},\"computePrecision\":\"{precision}\",\"isUpdatable\":\"0\",\"stateSchema\":[],\"availability\":{{{avail}}},\"modelType\":{{\"name\":\"MLModelType_pipeline\",\"structure\":[{models}]}},\"userDefinedMetadata\":{{{user_metadata}}},\"inputSchema\":{},\"generatedClassName\":\"model\",\"method\":\"predict\"}}]",schema_list(&types(&description.main.outputs),Some(&description.main.outputs),""),self.spec_version,schema_list(&types(&description.main.inputs),Some(&description.main.inputs),"")).into_bytes()
     }
-}
-
-fn numeric_precision(dtype: MILDataType) -> Option<&'static str> {
-    Some(match dtype {
-        MILDataType::Float16 => "Float16",
-        MILDataType::Float32 => "Float32",
-        MILDataType::Float64 => "Double",
-        MILDataType::Int8 => "Int8",
-        MILDataType::Int16 => "Int16",
-        MILDataType::Int32 => "Int32",
-        MILDataType::Int64 => "Int64",
-        MILDataType::Uint8 => "UInt8",
-        MILDataType::Uint16 => "UInt16",
-        _ => return None,
-    })
 }
 
 pub(crate) fn prepare_children(dir: &Path, pipeline: &PipelineBundle) -> io::Result<()> {

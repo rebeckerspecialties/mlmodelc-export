@@ -410,11 +410,56 @@ fn decode_value_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
     let mut reader = PBReader::new(data);
     while let Some((field, wire)) = reader.read_tag() {
         match field {
-            1 => return decode_tensor_type(reader.read_length_delimited()),
+            1 => return decode_tensor_type(type_field(&mut reader)?),
+            5 => return decode_state_type(type_field(&mut reader)?),
             _ => reader.skip(wire),
         }
     }
     Ok(MILType::new(MILDataType::Float32, Vec::new()))
+}
+
+/// A nested message of a type declaration. A declared length past the end of
+/// the data is an error here, not a panic.
+fn type_field<'a>(reader: &mut PBReader<'a>) -> Result<&'a [u8], MILDecoderError> {
+    reader
+        .try_read_length_delimited()
+        .ok_or_else(|| MILDecoderError::UnsupportedFormat("truncated type message".into()))
+}
+
+/// `StateType { ValueType wrappedType = 1; }`: a model state wrapping a tensor
+/// type. Function inputs of this type are declared as `state<tensor<...>>` and
+/// are read and written by `read_state` / `write_state`.
+fn decode_state_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
+    let mut reader = PBReader::new(data);
+    while let Some((field, wire)) = reader.read_tag() {
+        match field {
+            1 => return decode_wrapped_tensor_type(type_field(&mut reader)?),
+            _ => reader.skip(wire),
+        }
+    }
+    Err(missing_wrapped_tensor())
+}
+
+/// The `ValueType` inside a `StateType`. Only tensors can be wrapped; a state
+/// wrapping a state is rejected without descending into it.
+fn decode_wrapped_tensor_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
+    let mut reader = PBReader::new(data);
+    while let Some((field, wire)) = reader.read_tag() {
+        match field {
+            1 => return Ok(decode_tensor_type(type_field(&mut reader)?)?.into_state()),
+            5 => {
+                return Err(MILDecoderError::UnsupportedFormat(
+                    "state types wrapping another state type".into(),
+                ));
+            }
+            _ => reader.skip(wire),
+        }
+    }
+    Err(missing_wrapped_tensor())
+}
+
+fn missing_wrapped_tensor() -> MILDecoderError {
+    MILDecoderError::UnsupportedFormat("state type without a wrapped tensor type".into())
 }
 
 fn decode_tensor_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
@@ -432,7 +477,7 @@ fn decode_tensor_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
                     ));
                 }
             }
-            3 => shape.push(decode_dimension(reader.read_length_delimited())?),
+            3 => shape.push(decode_dimension(type_field(&mut reader)?)?),
             _ => reader.skip(wire),
         }
     }
@@ -447,7 +492,7 @@ fn decode_dimension(data: &[u8]) -> Result<MILDimension, MILDecoderError> {
     while let Some((field, wire)) = reader.read_tag() {
         match field {
             1 => {
-                let const_dim = reader.read_length_delimited();
+                let const_dim = type_field(&mut reader)?;
                 let mut sub = PBReader::new(const_dim);
                 let mut size = 0;
                 while let Some((sub_field, sub_wire)) = sub.read_tag() {
@@ -465,7 +510,7 @@ fn decode_dimension(data: &[u8]) -> Result<MILDimension, MILDecoderError> {
                 dimension = Some(MILDimension::Constant(size));
             }
             2 => {
-                let mut sub = PBReader::new(reader.read_length_delimited());
+                let mut sub = PBReader::new(type_field(&mut reader)?);
                 let mut variadic = false;
                 while let Some((field, wire)) = sub.read_tag() {
                     if field == 1 {
@@ -569,5 +614,142 @@ mod shape_tests {
         let mut blob = ty.to_vec();
         blob.extend_from_slice(&[0x2a, 0]);
         assert!(decode_value(&blob).is_err());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn message(field: u8, contents: &[u8]) -> Vec<u8> {
+        assert!(contents.len() < 128);
+        [&[field << 3 | 2, contents.len() as u8], contents].concat()
+    }
+
+    /// ValueType.tensorType = { dataType: FLOAT16, rank: 2, dimensions: [1, 4] }.
+    fn tensor_type() -> Vec<u8> {
+        let dimension = |size| message(3, &message(1, &[8, size]));
+        message(
+            1,
+            &[&[8, 10, 16, 2][..], &dimension(1), &dimension(4)].concat(),
+        )
+    }
+
+    /// ValueType.stateType = { wrappedType: `wrapped` }.
+    fn state_type(wrapped: &[u8]) -> Vec<u8> {
+        message(5, &message(1, wrapped))
+    }
+
+    fn unsupported(result: Result<MILType, MILDecoderError>) -> String {
+        match result {
+            Err(MILDecoderError::UnsupportedFormat(message)) => message,
+            other => panic!("expected an unsupported-format error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_type_wraps_its_tensor_type() {
+        let tensor = decode_value_type(&tensor_type()).unwrap();
+        assert!(!tensor.state);
+        let state = decode_value_type(&state_type(&tensor_type())).unwrap();
+        assert_eq!(state, tensor.clone().into_state());
+        assert_eq!(state.text_representation(), "state<tensor<fp16, [1, 4]>>");
+        // Unknown fields before the wrapped type are skipped at both levels.
+        let wrapped = [&[0x38, 1][..], &tensor_type()].concat();
+        let padded = message(5, &[&[0x38, 1][..], &message(1, &wrapped)].concat());
+        assert_eq!(decode_value_type(&padded).unwrap(), state);
+        // A named function input keeps the wrapper.
+        let named = [
+            message(1, b"state_0"),
+            message(2, &state_type(&tensor_type())),
+        ]
+        .concat();
+        let input = decode_named_value_type(&named).unwrap();
+        assert_eq!(input.name, "state_0");
+        assert_eq!(input.r#type, state);
+    }
+
+    #[test]
+    fn state_types_without_a_wrapped_tensor_are_errors() {
+        let missing = "state type without a wrapped tensor type";
+        // StateType {} and StateType { wrappedType: {} }.
+        assert_eq!(unsupported(decode_value_type(&message(5, &[]))), missing);
+        assert_eq!(unsupported(decode_value_type(&state_type(&[]))), missing);
+        // Only unknown fields, at either level.
+        assert_eq!(
+            unsupported(decode_value_type(&message(5, &[0x38, 1]))),
+            missing
+        );
+        assert_eq!(
+            unsupported(decode_value_type(&state_type(&[0x38, 1]))),
+            missing
+        );
+        // A wrapped list type (ValueType.listType = 2) is not a tensor.
+        assert_eq!(
+            unsupported(decode_value_type(&state_type(&message(2, &[])))),
+            missing
+        );
+    }
+
+    #[test]
+    fn nested_state_types_are_rejected_without_recursion() {
+        let nested = "state types wrapping another state type";
+        let inner = state_type(&tensor_type());
+        assert_eq!(unsupported(decode_value_type(&state_type(&inner))), nested);
+        // The inner state is not decoded: its own contents may be anything.
+        assert_eq!(
+            unsupported(decode_value_type(&state_type(&[0x2a, 0x7f]))),
+            nested
+        );
+    }
+
+    #[test]
+    fn invalid_wrapped_tensor_types_propagate_their_error() {
+        // dataType 99 is not a MIL data type.
+        let wrapped = message(1, &[8, 99]);
+        assert!(matches!(
+            decode_value_type(&state_type(&wrapped)),
+            Err(MILDecoderError::UnknownDataType(99))
+        ));
+        // A dimension with neither a constant nor an unknown extent.
+        let wrapped = message(1, &[&[8, 10][..], &message(3, &[])].concat());
+        assert!(decode_value_type(&state_type(&wrapped)).is_err());
+    }
+
+    #[test]
+    fn truncated_state_types_are_errors_not_panics() {
+        let complete = state_type(&tensor_type());
+        // Every proper prefix: a cut inside a nested message leaves a declared
+        // length that runs past the data.
+        for length in 1..complete.len() {
+            let message = unsupported(decode_value_type(&complete[..length]));
+            if length == 1 {
+                // A tag without its length reads as an empty state type.
+                assert_eq!(message, "state type without a wrapped tensor type");
+            } else {
+                assert_eq!(message, "truncated type message", "prefix {length}");
+            }
+        }
+        // The same cut one level down, with consistent outer lengths.
+        let tensor = tensor_type();
+        for length in 2..tensor.len() {
+            let result = decode_value_type(&state_type(&tensor[..length]));
+            assert_eq!(
+                unsupported(result),
+                "truncated type message",
+                "tensor prefix {length}"
+            );
+        }
+        // Truncated dimension messages inside an otherwise complete tensor type.
+        for dimension in [&[0x0a, 5, 8][..], &[0x12, 5, 8]] {
+            let wrapped = message(1, &[&[8, 10][..], &message(3, dimension)].concat());
+            let result = decode_value_type(&state_type(&wrapped));
+            assert_eq!(unsupported(result), "truncated type message");
+        }
+        // Plain tensor types report the same error.
+        assert_eq!(
+            unsupported(decode_value_type(&tensor[..tensor.len() - 1])),
+            "truncated type message"
+        );
     }
 }

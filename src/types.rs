@@ -70,11 +70,15 @@ impl std::fmt::Display for MILDimension {
     }
 }
 
-/// A MIL tensor type: data type + shape.
+/// A MIL tensor type: data type + shape, optionally wrapped in a model state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MILType {
     pub data_type: MILDataType,
     pub shape: Vec<MILDimension>,
+    /// `state<tensor<...>>` (CoreML8 / iOS 18): a mutable state the program
+    /// reads with `read_state` and writes with `write_state`. State tensors
+    /// have fixed shapes; CoreML accepts only fp16 state storage.
+    pub state: bool,
 }
 
 impl MILType {
@@ -86,7 +90,17 @@ impl MILType {
     }
 
     pub fn with_dimensions(data_type: MILDataType, shape: Vec<MILDimension>) -> Self {
-        Self { data_type, shape }
+        Self {
+            data_type,
+            shape,
+            state: false,
+        }
+    }
+
+    /// Wrap this tensor type in a model state (`state<tensor<...>>`).
+    pub fn into_state(mut self) -> Self {
+        self.state = true;
+        self
     }
 
     /// Returns `None` if any extent is determined at runtime.
@@ -105,17 +119,24 @@ impl MILType {
         self.shape.is_empty()
     }
 
-    /// Format as MIL text: `fp32` for scalars, `tensor<fp32, [1, 32]>` for tensors.
+    /// Format as MIL text: `fp32` for scalars, `tensor<fp32, [1, 32]>` for tensors
+    /// and `state<tensor<fp16, [1, 32]>>` for model states.
     pub fn text_representation(&self) -> String {
-        if self.is_scalar() {
-            return self.data_type.text_name().to_string();
+        let inner = if self.is_scalar() {
+            self.data_type.text_name().to_string()
+        } else {
+            let dims: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
+            format!(
+                "tensor<{}, [{}]>",
+                self.data_type.text_name(),
+                dims.join(", ")
+            )
+        };
+        if self.state {
+            format!("state<{inner}>")
+        } else {
+            inner
         }
-        let dims: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
-        format!(
-            "tensor<{}, [{}]>",
-            self.data_type.text_name(),
-            dims.join(", ")
-        )
     }
 }
 
@@ -263,4 +284,30 @@ pub struct MILProgram {
     /// Raw protobuf bytes of `Model.description`. Retained for tools that want
     /// to round-trip the description, including flexible shapes and function selection.
     pub description_data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_types_wrap_the_tensor_text() {
+        let tensor = MILType::new(MILDataType::Float16, vec![1, 4]);
+        assert!(!tensor.state);
+        assert_eq!(tensor.text_representation(), "tensor<fp16, [1, 4]>");
+        let state = tensor.clone().into_state();
+        assert!(state.state);
+        assert_eq!(state.text_representation(), "state<tensor<fp16, [1, 4]>>");
+        assert_ne!(state, tensor);
+        // The wrapper leaves the tensor's own properties alone.
+        assert_eq!(state.concrete_shape(), Some(vec![1, 4]));
+        assert!(!state.is_scalar());
+    }
+
+    #[test]
+    fn scalar_types_print_with_and_without_a_state_wrapper() {
+        let scalar = MILType::new(MILDataType::Float16, Vec::new());
+        assert_eq!(scalar.text_representation(), "fp16");
+        assert_eq!(scalar.into_state().text_representation(), "state<fp16>");
+    }
 }

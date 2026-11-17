@@ -1,0 +1,17 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3605.1.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func main<ios18>(state<tensor<fp16, [1, 4]>> state_0, state<tensor<fp16, [1, 4]>> state_1, tensor<fp32, [1, 4]> x) {
+            tensor<fp16, [1, 4]> state_0_state_read = read_state(input = state_0);
+            tensor<fp32, [1, 4]> state_0_read = cast(dtype = string("fp32"), x = state_0_state_read);
+            tensor<fp16, [1, 4]> state_1_state_read = read_state(input = state_1);
+            tensor<fp32, [1, 4]> state_1_read = cast(dtype = string("fp32"), x = state_1_state_read);
+            tensor<fp32, [1, 4]> next_state_0 = add(x = state_0_read, y = x);
+            tensor<fp32, [1, 4]> next_state_1 = add(x = state_1_read, y = next_state_0);
+            tensor<fp32, [1, 4]> y = add(x = next_state_0, y = next_state_1);
+            tensor<fp16, [1, 4]> next_state_0_state_value = cast(dtype = string("fp16"), x = next_state_0);
+            write_state(data = next_state_0_state_value, input = state_0);
+            tensor<fp16, [1, 4]> next_state_1_state_value = cast(dtype = string("fp16"), x = next_state_1);
+            write_state(data = next_state_1_state_value, input = state_1);
+        } -> (y);
+}

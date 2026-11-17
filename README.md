@@ -38,6 +38,9 @@ byte-for-byte against captured `coremlc` output. `metadata.json` is compared
 structurally, excluding generated class names and optimization statistics.
 The exporter reports source operations, not Apple's optimized executable.
 
+`mlmodelc_export::VERSION` is the crate version. Callers that cache exported
+bundles can put it in the cache key.
+
 ## Quick start
 
 ### Library
@@ -165,7 +168,7 @@ on adding new fixtures.
 
 ## Status
 
-`v0.1` — works for the small-graph cases in our test fixtures. Round-trip
+`v0.2` — works for the small-graph cases in our test fixtures. Round-trip
 verified against `xcrun coremlc compile` (Xcode 26.4, `coremlc` 3520.4.1):
 
 - `model.mil` byte-identical except for the `buildInfo` producer string
@@ -189,9 +192,60 @@ On macOS 15+, check exact predictions and runtime metadata with:
 swift tests/runtime_identifiers.swift target/release/mlmodelc-export tests/fixtures/generate_identifiers.py
 ```
 
-Append `--check-invalid` to also reproduce the loader rejection of an unescaped
-`state` input on affected CoreML versions. CI requires the normalized positive
-case, without requiring future runtimes to reject the negative control.
+Append `--check-invalid` to also reproduce the loader rejection of a tensor
+input whose name is the unescaped word `state` on affected CoreML versions.
+That control concerns the identifier only; model state inputs, described below,
+are declared with the `state<...>` type and load. CI requires the normalized
+positive case, without requiring future runtimes to reject the negative control.
+
+### Model state
+
+Model state (CoreML8 opset, iOS 18 / macOS 15) is supported:
+
+- `state<tensor<fp16, [...]>>` function inputs (`ValueType.stateType`), read
+  with `read_state` and written with `write_state`. `write_state` has no
+  outputs and is emitted as a bare call.
+- `ModelDescription.state` and `FunctionDescription.state` reach
+  `coremldata.bin` unchanged, and the states are listed under `stateSchema` in
+  `metadata.json` instead of `inputSchema`.
+- A state type must wrap a tensor type. A state type without one, a state
+  wrapping a state and a type message cut short by its declared length return
+  an unsupported-format error.
+
+Three fixtures compare byte for byte with `coremlc`: one FP16 state, two FP16
+states carrying FP32 values through casts, and one whose declaration orders
+differ between the function and the description. `coreml_update_state` passes
+through like any other operation but has no fixture. Function inputs are
+written in byte order of their names, as `coremlc` writes them, whatever their
+order in the source; schema entries keep the order of the source description.
+
+iOS 18 `constexpr_blockwise_shift_scale` constants are covered by two more
+fixtures: uint8 data with a uint8 offset and FP16 scales per 32-column block
+read from `weights.bin`, and int8 data with FP32 unit and per-row scales and no
+offset. `data`, `scale` and `offset` are `const` operations referenced by name;
+as in `coremlc` output, a `constexpr_*` operation prints those constants as
+literal values. On macOS 15+, check accumulation across predictions, a second
+state starting from zeros, and the dequantized weights with:
+
+```sh
+cargo build --release
+swift tests/runtime_state.swift target/release/mlmodelc-export tests/fixtures
+```
+
+The 16 predictions run CPU-only and every value is exact.
+
+In `metadata.json`, the operation histogram uses `coremlc`'s key form
+(`Ios18.constexprBlockwiseShiftScale`, `Ios18.readState`) and leaves out
+`const`; `storagePrecision` lists the data types read from weight files and
+`computePrecision` the numeric types of operation outputs. These match the
+native output for the committed fixtures except where `coremlc` reports an
+operation under an older opset (`Ios16.constexprAffineDequantize`); they remain
+statistics of the source graph. Constants compressed inline rather than in a
+weight file are not reflected in `storagePrecision`.
+
+For callers constructing intermediate types directly, `MILType` has a public
+`state` field since 0.2.0. `MILType::new` and `MILType::with_dimensions` build
+tensor types; `MILType::into_state` wraps one in a state.
 
 Enumerated input shapes, variable-rank tensors and variadic dimensions currently
 return an explicit unsupported-format error instead of emitting an invalid model.

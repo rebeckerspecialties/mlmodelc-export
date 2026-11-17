@@ -69,6 +69,9 @@ pub use types::{
     MILOperation, MILProgram, MILTensorData, MILType, MILValue,
 };
 
+/// Version of this crate; callers can put it in cache keys for bundles this crate wrote.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Statistics computed from a single compile pass.
 #[derive(Debug, Clone)]
 pub struct CompileStats {

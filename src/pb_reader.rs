@@ -60,6 +60,19 @@ impl<'a> PBReader<'a> {
         &self.data[start..start + len]
     }
 
+    /// Like [`Self::read_length_delimited`], but `None` instead of a panic when
+    /// the declared length runs past the end of the data.
+    pub fn try_read_length_delimited(&mut self) -> Option<&'a [u8]> {
+        let len = self.read_varint();
+        let start = self.offset.min(self.data.len());
+        if len > (self.data.len() - start) as u64 {
+            return None;
+        }
+        // `len` fits in `usize`: it is at most the remaining slice length.
+        self.offset = start + len as usize;
+        Some(&self.data[start..self.offset])
+    }
+
     /// Read a UTF-8 string (length-delimited).
     pub fn read_string(&mut self) -> String {
         let bytes = self.read_length_delimited();
@@ -122,4 +135,29 @@ pub(crate) fn read_packed_floats(data: &[u8]) -> Vec<f32> {
         result.push(reader.read_float32());
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_length_delimited_read_rejects_lengths_past_the_end() {
+        let mut reader = PBReader::new(&[2, 7, 8, 9]);
+        assert_eq!(reader.try_read_length_delimited(), Some(&[7u8, 8][..]));
+        assert_eq!(reader.offset, 3);
+        // One byte left, two declared.
+        let mut reader = PBReader::new(&[2, 7]);
+        assert_eq!(reader.try_read_length_delimited(), None);
+        // A length that does not fit the address space.
+        let huge = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 7];
+        assert_eq!(PBReader::new(&huge).try_read_length_delimited(), None);
+        // Zero-length fields at the very end, and after skipping past it.
+        let mut reader = PBReader::new(&[0]);
+        assert_eq!(reader.try_read_length_delimited(), Some(&[][..]));
+        let mut reader = PBReader::new(&[9]);
+        reader.skip(2);
+        assert!(reader.is_at_end());
+        assert_eq!(reader.try_read_length_delimited(), Some(&[][..]));
+    }
 }

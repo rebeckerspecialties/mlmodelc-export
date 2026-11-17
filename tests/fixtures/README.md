@@ -119,3 +119,57 @@ compiler capture details and hashes. The golden comparison detects the old
 FP16 mantissa alignment and dropped constexpr attributes without executing
 CoreML. Runtime checks use FP32 outputs with CPU-only execution and no tolerance
 that could hide flushed subnormals or an incorrect dequantization parameter.
+
+## Model state and blockwise constants
+
+All five fixtures use the CoreML8 opset and specification version 9. Sources
+are generated with Python's standard library; no model download, training data
+or captured model output is used.
+
+- `stateful-fp16`: FP16 input `x` and FP16 state `state_0`, both `[1, 4]`.
+  `next_state_0 = read_state(state_0) + x`, `y = next_state_0 + x`, then
+  `write_state`. The function declares `x` before the state; `coremlc` writes
+  function inputs in name order.
+- `stateful-fp32-pair`: FP32 input and two FP16 states. Each state is cast to
+  FP32 after `read_state` and back to FP16 before `write_state`.
+  `next_state_0 = state_0 + x`, `next_state_1 = state_1 + next_state_0`,
+  `y = next_state_0 + next_state_1`.
+- `stateful-declaration-order`: the function declares `s1, q, s0, p`; the
+  description lists inputs `q, p` and states `s1, s0`. The MIL signature is
+  `p, q, s0, s1`; `inputSchema` and `stateSchema` keep the description order.
+- `blockwise-uint8-offset`: `constexpr_blockwise_shift_scale` with uint8 data
+  `[2, 64]` and FP16 scales `[2, 2]` (one per row and 32-column block) from
+  `weights.bin`, and an inline uint8 offset of 128. The FP16 result is the
+  transposed right operand of a `matmul` with the FP16 cast of the input.
+- `blockwise-int8-scales`: int8 data `[2, 4]` from `weights.bin`, decoded twice
+  without an offset: with the FP32 `[1, 1]` scale 1 and with FP32 per-row
+  scales `[[0.5], [0.25]]`. The output is the input plus both results.
+
+In both blockwise sources `data`, `scale` and `offset` are `const` operations
+referenced by name. `coremlc` keeps those operations and prints the same
+values again as literal arguments of the `constexpr_*` operation.
+
+```sh
+python3 -B tests/fixtures/generate_state.py
+python3 -B tests/fixtures/generate_state.py --check
+python3 -B tests/fixtures/generate_blockwise.py
+python3 -B tests/fixtures/generate_blockwise.py --check
+```
+
+The generators do not create golden output. The goldens were captured on
+2026-11-16 with Xcode 27.2 (27B48), coremlc 3600.25.1, MIL component 3605.1.1,
+by the procedure above, each blockwise model with its `weights/` beside it.
+They are unmodified Apple compiler output. Capture invokes compilation only.
+
+`tests/state_fixtures.rs` and `tests/blockwise_fixtures.rs` check the decoded
+sources and weight payloads. `tests/metadata_statistics.rs` compares
+`storagePrecision`, `computePrecision` and the operation histogram of every
+fixture in this directory with its golden; `flexible-range` and
+`quantized-constexpr` are listed there as histogram exceptions.
+
+`tests/runtime_state.swift` loads the bundles written by the Rust exporter and
+checks 16 exact CPU-only predictions: three accumulating steps on one
+`MLState`, a second state starting from zeros while the first continues, the
+stored value of each named state, and the blockwise weights against values
+worked out in the script (single columns in each 32-column block, then all
+ones). Run it as documented in the repository README.
