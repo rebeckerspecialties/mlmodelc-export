@@ -11,11 +11,59 @@
 //! - Multi-output ops list each output as `type name`, comma-separated, with
 //!   no enclosing brackets or parens — Apple's loader rejects both `(...)`
 //!   and `[...]` LHS forms.
+//! - Function inputs are listed in byte order of their names, not in source
+//!   order. States are declared as `state<tensor<fp16, [...]>> name`.
+//! - Ops without outputs (`write_state`) are bare calls with no left-hand side.
+//! - `constexpr_*` ops print a referenced `const` as its literal value; other
+//!   ops and references to non-`const` values keep the name.
 
 use crate::description::{FunctionDescription, ModelDescription, ShapeFlexibility, shape_text};
 use crate::hex_float::{hex_float16, hex_float32, hex_float32_bytes};
 use crate::sink::MILOutputSink;
 use crate::types::*;
+use std::collections::HashMap;
+
+/// Per-function emission state.
+struct Scope<'a> {
+    /// Pipeline children borrow assets from the bundle root.
+    shared_root: bool,
+    /// `const` values by output name, collected only when a `constexpr_*` op
+    /// refers to a value by name.
+    consts: HashMap<&'a str, &'a MILValue>,
+}
+
+impl<'a> Scope<'a> {
+    fn new(function: &'a MILFunction, shared_root: bool) -> Self {
+        let mut consts = HashMap::new();
+        let needed = function.block.all_operations().any(|op| {
+            is_constexpr(op)
+                && op
+                    .inputs
+                    .iter()
+                    .flat_map(|(_, bindings)| bindings)
+                    .any(|binding| matches!(binding, MILBinding::Reference(_)))
+        });
+        if needed {
+            for op in function.block.all_operations() {
+                if op.r#type != "const" {
+                    continue;
+                }
+                let value = op.attributes.iter().find(|(key, _)| key == "val");
+                if let (Some(output), Some((_, value))) = (op.outputs.first(), value) {
+                    consts.insert(output.name.as_str(), value);
+                }
+            }
+        }
+        Self {
+            shared_root,
+            consts,
+        }
+    }
+}
+
+fn is_constexpr(op: &MILOperation) -> bool {
+    op.r#type.starts_with("constexpr_")
+}
 
 /// Emit the full MIL text for `program` into an in-memory string.
 pub fn emit_to_string(program: &MILProgram) -> String {
@@ -61,7 +109,11 @@ fn emit_function(
     let tag = opset_tag(&function.opset);
     out.write_str(&format!("    func {name}<{tag}>("));
 
-    for (i, input) in function.inputs.iter().enumerate() {
+    // coremlc lists function inputs in byte order of their names, whatever
+    // their order in the source protobuf.
+    let mut inputs: Vec<&MILNamedType> = function.inputs.iter().collect();
+    inputs.sort_by(|a, b| a.name.cmp(&b.name));
+    for (i, input) in inputs.into_iter().enumerate() {
         if i > 0 {
             out.write_str(", ");
         }
@@ -78,8 +130,9 @@ fn emit_function(
     }
     out.write_str(" {\n");
 
+    let scope = Scope::new(function, shared_root);
     for op in &function.block.operations {
-        emit_operation(op, out, shared_root);
+        emit_operation(op, out, &scope);
     }
 
     let outs = function.block.outputs.join(", ");
@@ -127,19 +180,19 @@ fn emit_flexible_shapes(description: &FunctionDescription, out: &mut MILOutputSi
     ));
 }
 
-fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool) {
-    emit_operation_at(op, out, shared_root, 12);
+fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, scope: &Scope) {
+    emit_operation_at(op, out, scope, 12);
 }
 
-fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bool, depth: usize) {
+fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, scope: &Scope, depth: usize) {
     let padding = " ".repeat(depth);
     let indent = padding.as_str();
-
-    let Some(first_output) = op.outputs.first() else {
-        return;
-    };
+    let shared_root = scope.shared_root;
 
     if op.r#type == "const" {
+        let Some(first_output) = op.outputs.first() else {
+            return;
+        };
         emit_const_operation(first_output, &op.attributes, indent, out, shared_root);
         return;
     }
@@ -159,13 +212,15 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bo
             out.write_str(&format!("{} {}", o.r#type.text_representation(), o.name));
         }
         out.write_str(" = ");
-    } else {
+    } else if let Some(first_output) = op.outputs.first() {
         out.write_str(&format!(
             "{} {} = ",
             first_output.r#type.text_representation(),
             first_output.name
         ));
     }
+    // Otherwise the op has no outputs and therefore no left-hand side:
+    // coremlc prints `write_state(data = ..., input = ...)` as a bare call.
 
     out.write_str(&format!("{}(", op.r#type));
 
@@ -176,7 +231,7 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bo
             out.write_str(", ");
         }
         out.write_str(&format!("{key} = "));
-        emit_bindings(bindings, out, shared_root);
+        emit_bindings(bindings, out, scope, is_constexpr(op));
     }
 
     out.write_str(")");
@@ -209,7 +264,7 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bo
         }
         out.write_str(") {\n");
         for child in &block.operations {
-            emit_operation_at(child, out, shared_root, depth + 8);
+            emit_operation_at(child, out, scope, depth + 8);
         }
         out.write_str(&format!(
             "{} }} -> ({})",
@@ -247,9 +302,9 @@ fn emit_const_operation(
     out.write_str("];\n");
 }
 
-fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink, shared_root: bool) {
+fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink, scope: &Scope, inline: bool) {
     if bindings.len() == 1 {
-        emit_binding(&bindings[0], out, shared_root);
+        emit_binding(&bindings[0], out, scope, inline);
         return;
     }
     out.write_str("(");
@@ -257,15 +312,20 @@ fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink, shared_root: 
         if i > 0 {
             out.write_str(", ");
         }
-        emit_binding(b, out, shared_root);
+        emit_binding(b, out, scope, inline);
     }
     out.write_str(")");
 }
 
-fn emit_binding(binding: &MILBinding, out: &mut MILOutputSink, shared_root: bool) {
+/// `inline` is set for `constexpr_*` ops: coremlc prints their `const`
+/// arguments as literal values and leaves the `const` op in place.
+fn emit_binding(binding: &MILBinding, out: &mut MILOutputSink, scope: &Scope, inline: bool) {
     match binding {
-        MILBinding::Reference(name) => out.write_str(name),
-        MILBinding::Immediate(value) => emit_typed_literal(value, out, shared_root),
+        MILBinding::Reference(name) => match scope.consts.get(name.as_str()).filter(|_| inline) {
+            Some(value) => emit_typed_literal(value, out, scope.shared_root),
+            None => out.write_str(name),
+        },
+        MILBinding::Immediate(value) => emit_typed_literal(value, out, scope.shared_root),
     }
 }
 
@@ -577,6 +637,248 @@ fn opset_tag(opset: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tensor(data_type: MILDataType, shape: &[usize]) -> MILType {
+        MILType::new(data_type, shape.to_vec())
+    }
+
+    fn named(name: &str, r#type: MILType) -> MILNamedType {
+        MILNamedType {
+            name: name.into(),
+            r#type,
+        }
+    }
+
+    fn reference(key: &str, name: &str) -> (String, Vec<MILBinding>) {
+        (key.into(), vec![MILBinding::Reference(name.into())])
+    }
+
+    fn operation(
+        kind: &str,
+        inputs: Vec<(String, Vec<MILBinding>)>,
+        outputs: Vec<MILNamedType>,
+    ) -> MILOperation {
+        MILOperation {
+            r#type: kind.into(),
+            blocks: Vec::new(),
+            inputs,
+            outputs,
+            attributes: Vec::new(),
+        }
+    }
+
+    fn constant(name: &str, value: MILValue) -> MILOperation {
+        let mut op = operation("const", Vec::new(), vec![named(name, value.r#type.clone())]);
+        op.attributes.push(("val".into(), value));
+        op
+    }
+
+    fn int8_value(values: &[i32]) -> MILValue {
+        MILValue::new(
+            tensor(MILDataType::Int8, &[values.len()]),
+            MILTensorData::Ints(values.to_vec()),
+        )
+    }
+
+    fn blob_value() -> MILValue {
+        MILValue {
+            r#type: tensor(MILDataType::Uint8, &[2, 2]),
+            tensor: MILTensorData::default(),
+            blob: Some(MILBlobRef {
+                filename: "@model_path/weights/weights.bin".into(),
+                offset: 64,
+            }),
+        }
+    }
+
+    fn program(inputs: Vec<MILNamedType>, operations: Vec<MILOperation>) -> MILProgram {
+        MILProgram {
+            version: 1,
+            functions: vec![(
+                "main".into(),
+                MILFunction {
+                    inputs,
+                    opset: "CoreML8".into(),
+                    block: MILBlock {
+                        inputs: Vec::new(),
+                        outputs: vec!["y".into()],
+                        operations,
+                    },
+                },
+            )],
+            spec_version: 9,
+            description_data: Vec::new(),
+        }
+    }
+
+    fn body(program: &MILProgram) -> Vec<String> {
+        let text = emit_to_string(program);
+        let lines: Vec<_> = text.lines().map(|line| line.trim().to_owned()).collect();
+        lines[4..lines.len() - 2].to_vec()
+    }
+
+    #[test]
+    fn function_inputs_are_listed_in_byte_order_of_their_names() {
+        let fp16 = tensor(MILDataType::Float16, &[1, 4]);
+        let inputs = ["z", "B", "a", "_c", "a10", "a2"]
+            .into_iter()
+            .map(|name| named(name, fp16.clone()))
+            .chain([named("state_0", fp16.clone().into_state())])
+            .collect();
+        let program = program(inputs, Vec::new());
+        let text = emit_to_string(&program);
+        let ty = "tensor<fp16, [1, 4]>";
+        assert!(
+            text.contains(&format!(
+                "func main<ios18>({ty} B, {ty} _c, {ty} a, {ty} a10, {ty} a2, state<{ty}> state_0, {ty} z) {{"
+            )),
+            "{text}"
+        );
+        // The decoded program keeps the source order for the feature schemas.
+        assert_eq!(program.functions[0].1.inputs[0].name, "z");
+    }
+
+    #[test]
+    fn operations_without_outputs_are_bare_calls() {
+        let fp16 = tensor(MILDataType::Float16, &[1, 4]);
+        let program = program(
+            vec![
+                named("x", fp16.clone()),
+                named("state_0", fp16.clone().into_state()),
+            ],
+            vec![
+                operation(
+                    "read_state",
+                    vec![reference("input", "state_0")],
+                    vec![named("y", fp16.clone())],
+                ),
+                operation(
+                    "write_state",
+                    vec![reference("input", "state_0"), reference("data", "y")],
+                    Vec::new(),
+                ),
+                // A `const` declares its output; without one there is nothing to print.
+                operation("const", Vec::new(), Vec::new()),
+                operation(
+                    "split",
+                    vec![reference("x", "y")],
+                    vec![named("left", fp16.clone()), named("right", fp16)],
+                ),
+            ],
+        );
+        assert_eq!(
+            body(&program),
+            [
+                "tensor<fp16, [1, 4]> y = read_state(input = state_0);",
+                "write_state(data = y, input = state_0);",
+                "tensor<fp16, [1, 4]> left, tensor<fp16, [1, 4]> right = split(x = y);",
+            ]
+        );
+    }
+
+    #[test]
+    fn constexpr_operations_print_referenced_constants_as_literals() {
+        let fp32 = tensor(MILDataType::Float32, &[3]);
+        let mut unnamed = operation("const", Vec::new(), Vec::new());
+        unnamed.attributes.push(("val".into(), int8_value(&[9])));
+        let program = program(
+            vec![named("x", fp32.clone())],
+            vec![
+                constant("data", int8_value(&[-128, 0, 127])),
+                constant("blob", blob_value()),
+                // Neither a `const` without a value nor one without an output is a literal.
+                operation("const", Vec::new(), vec![named("empty", fp32.clone())]),
+                unnamed,
+                operation(
+                    "constexpr_blockwise_shift_scale",
+                    vec![
+                        reference("data", "data"),
+                        reference("scale", "blob"),
+                        reference("offset", "empty"),
+                    ],
+                    vec![named("weight", fp32.clone())],
+                ),
+                // Another constexpr result and a function input stay names.
+                operation(
+                    "constexpr_lut_to_dense",
+                    vec![
+                        reference("lut", "weight"),
+                        reference("indices", "x"),
+                        (
+                            "pair".into(),
+                            vec![
+                                MILBinding::Reference("data".into()),
+                                MILBinding::Reference("weight".into()),
+                            ],
+                        ),
+                    ],
+                    vec![named("dense", fp32.clone())],
+                ),
+                // Ordinary operations keep the reference to a `const`.
+                operation(
+                    "add",
+                    vec![reference("x", "data"), reference("y", "dense")],
+                    vec![named("y", fp32)],
+                ),
+            ],
+        );
+        let literal = "tensor<int8, [3]>([-128, 0, 127])";
+        let blob = "tensor<uint8, [2, 2]>(BLOBFILE(path = string(\"@model_path/weights/weights.bin\"), offset = uint64(64)))";
+        assert_eq!(
+            body(&program),
+            [
+                format!("tensor<int8, [3]> data = const()[val = {literal}];"),
+                format!("tensor<uint8, [2, 2]> blob = const()[val = {blob}];"),
+                "tensor<fp32, [3]> empty = const()[];".to_owned(),
+                format!(
+                    "tensor<fp32, [3]> weight = constexpr_blockwise_shift_scale(data = {literal}, offset = empty, scale = {blob});"
+                ),
+                format!(
+                    "tensor<fp32, [3]> dense = constexpr_lut_to_dense(indices = x, lut = weight, pair = ({literal}, weight));"
+                ),
+                "tensor<fp32, [3]> y = add(x = data, y = dense);".to_owned(),
+            ]
+        );
+        // A Pipeline child relocates the inlined asset path like any other.
+        let mut sink = MILOutputSink::in_memory(4096);
+        emit_pipeline_child(&program, &mut sink);
+        let child = String::from_utf8(sink.finalize().unwrap()).unwrap();
+        assert_eq!(
+            child.matches("@model_path/../weights/weights.bin").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn constexpr_operations_with_immediate_arguments_need_no_constant_table() {
+        let fp32 = tensor(MILDataType::Float32, &[3]);
+        let mut legacy = operation(
+            "constexpr_cast",
+            vec![(
+                "source".into(),
+                vec![MILBinding::Immediate(int8_value(&[1, 2, 3]))],
+            )],
+            vec![named("y", fp32.clone())],
+        );
+        legacy.attributes.push(("axis".into(), int8_value(&[0])));
+        let function = MILFunction {
+            inputs: Vec::new(),
+            opset: "CoreML7".into(),
+            block: MILBlock {
+                inputs: Vec::new(),
+                outputs: vec!["y".into()],
+                operations: vec![constant("data", int8_value(&[4])), legacy],
+            },
+        };
+        assert!(Scope::new(&function, false).consts.is_empty());
+        let mut with_reference = function.clone();
+        with_reference.block.operations[1]
+            .inputs
+            .push(reference("other", "data"));
+        let scope = Scope::new(&with_reference, true);
+        assert!(scope.shared_root);
+        assert_eq!(scope.consts.keys().copied().collect::<Vec<_>>(), ["data"]);
+    }
 
     #[test]
     fn pipeline_relocation_handles_attribute_and_immediate_binding_without_mutation() {

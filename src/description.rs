@@ -20,6 +20,8 @@ pub(crate) struct FeatureDescription {
     pub optional: bool,
     pub shape: Vec<i64>,
     pub flexibility: Option<ShapeFlexibility>,
+    /// Declared through `FeatureType.stateType` (a model state, not an input).
+    pub state: bool,
 }
 
 impl FeatureDescription {
@@ -44,6 +46,8 @@ pub(crate) struct FunctionDescription {
     pub name: String,
     pub inputs: Vec<FeatureDescription>,
     pub outputs: Vec<FeatureDescription>,
+    /// Model states (`ModelDescription.state` / `FunctionDescription.state`).
+    pub states: Vec<FeatureDescription>,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +72,10 @@ impl ModelDescription {
                 10 => result
                     .main
                     .outputs
+                    .push(decode_feature(reader.read_length_delimited())),
+                13 => result
+                    .main
+                    .states
                     .push(decode_feature(reader.read_length_delimited())),
                 20 => result
                     .functions
@@ -126,6 +134,9 @@ fn decode_function(data: &[u8]) -> FunctionDescription {
             3 => result
                 .outputs
                 .push(decode_feature(reader.read_length_delimited())),
+            6 => result
+                .states
+                .push(decode_feature(reader.read_length_delimited())),
             _ => reader.skip(wire),
         }
     }
@@ -144,6 +155,17 @@ fn decode_feature(data: &[u8]) -> FeatureDescription {
                 while let Some((field, wire)) = ty.read_tag() {
                     match field {
                         5 => decode_array(ty.read_length_delimited(), &mut result),
+                        8 => {
+                            // StateFeatureType { ArrayFeatureType arrayType = 1; }
+                            result.state = true;
+                            let mut state = PBReader::new(ty.read_length_delimited());
+                            while let Some((field, wire)) = state.read_tag() {
+                                match field {
+                                    1 => decode_array(state.read_length_delimited(), &mut result),
+                                    _ => state.skip(wire),
+                                }
+                            }
+                        }
                         1000 => result.optional = ty.read_varint() != 0,
                         _ => ty.skip(wire),
                     }
@@ -229,6 +251,103 @@ mod tests {
         decode_array(&[8, 2, 8, 4], &mut unpacked);
         assert_eq!(packed.default_shape(), vec![2, 4]);
         assert_eq!(packed.default_shape(), unpacked.default_shape());
+    }
+
+    fn message(field: u32, contents: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for mut value in [u64::from(field << 3 | 2), contents.len() as u64] {
+            while value >= 128 {
+                bytes.push((value as u8 & 127) | 128);
+                value >>= 7;
+            }
+            bytes.push(value as u8);
+        }
+        bytes.extend_from_slice(contents);
+        bytes
+    }
+
+    /// ArrayFeatureType { shape: [1, 4], dataType: FLOAT16 }.
+    const ARRAY: [u8; 8] = [10, 2, 1, 4, 16, 0x90, 0x80, 4];
+
+    fn feature(name: &str, feature_type: &[u8]) -> Vec<u8> {
+        [message(1, name.as_bytes()), message(3, feature_type)].concat()
+    }
+
+    fn state_feature(name: &str) -> Vec<u8> {
+        // FeatureType.stateType = 8 { StateFeatureType.arrayType = 1 }.
+        feature(name, &message(8, &message(1, &ARRAY)))
+    }
+
+    #[test]
+    fn model_level_states_are_kept_apart_from_inputs_and_outputs() {
+        let data = [
+            message(1, &feature("x", &message(5, &ARRAY))),
+            message(10, &feature("y", &message(5, &ARRAY))),
+            message(13, &state_feature("state_0")),
+            message(13, &state_feature("state_1")),
+        ]
+        .concat();
+        let description = ModelDescription::decode(&data);
+        let main = description.function("main").unwrap();
+        let names = |features: &[FeatureDescription]| {
+            features
+                .iter()
+                .map(|feature| feature.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&main.inputs), ["x"]);
+        assert_eq!(names(&main.outputs), ["y"]);
+        assert_eq!(names(&main.states), ["state_0", "state_1"]);
+        assert!(!main.inputs[0].state);
+        assert!(!main.outputs[0].state);
+        for state in &main.states {
+            assert!(state.state);
+            assert_eq!(state.shape, [1, 4]);
+            assert_eq!(state.data_type, 65552);
+            assert!(!state.optional);
+            assert!(state.flexibility.is_none());
+        }
+        // A description without states has none.
+        let stateless = ModelDescription::decode(&message(1, &feature("x", &message(5, &ARRAY))));
+        assert!(stateless.main.states.is_empty());
+    }
+
+    #[test]
+    fn function_level_states_use_their_own_field() {
+        let function = [
+            message(1, b"step"),
+            message(2, &feature("x", &message(5, &ARRAY))),
+            message(3, &feature("y", &message(5, &ARRAY))),
+            message(6, &state_feature("memory")),
+        ]
+        .concat();
+        let description = ModelDescription::decode(&message(20, &function));
+        assert!(description.function("main").is_none());
+        let step = description.function("step").unwrap();
+        assert_eq!(step.inputs.len(), 1);
+        assert_eq!(step.outputs.len(), 1);
+        assert_eq!(step.states.len(), 1);
+        assert_eq!(step.states[0].name, "memory");
+        assert!(step.states[0].state);
+        assert!(!step.inputs[0].state);
+        assert_eq!(step.states[0].default_shape(), [1, 4]);
+    }
+
+    #[test]
+    fn state_feature_types_tolerate_unknown_and_missing_fields() {
+        // An unknown varint field before the array type, then the optional flag.
+        let padded = [&[0x38, 1][..], &message(1, &ARRAY)].concat();
+        let ty = [message(8, &padded), vec![0xc0, 0x3e, 1]].concat();
+        let state = decode_feature(&feature("s", &ty));
+        assert!(state.state);
+        assert!(state.optional);
+        assert_eq!(state.shape, [1, 4]);
+        assert_eq!(state.data_type, 65552);
+        // StateFeatureType {} declares a state without an array type.
+        let empty = decode_feature(&feature("s", &message(8, &[])));
+        assert!(empty.state);
+        assert!(empty.shape.is_empty());
+        assert_eq!(empty.data_type, 0);
     }
 
     #[test]

@@ -14,12 +14,14 @@
 //! The wire layout of `coremldata.bin` matches Apple `coremlc` 3520.x
 //! byte-for-byte for the small models we've validated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::description::{FeatureDescription, ModelDescription, ShapeFlexibility, shape_text};
+use crate::description::{
+    FeatureDescription, FunctionDescription, ModelDescription, ShapeFlexibility, shape_text,
+};
 use crate::types::*;
 
 /// In-memory representation of a `.mlmodelc` bundle, ready to write to disk.
@@ -209,8 +211,12 @@ fn append_analytics_entry(bin: &mut Vec<u8>, key: &str, value: &str) {
 
 /// Generate `metadata.json`.
 ///
-/// I/O schemas use the source defaults and constraints. Operation statistics
-/// describe the source MIL graph rather than Apple's optimized executable.
+/// I/O and state schemas use the source defaults and constraints, in the order
+/// of the source description. Operation statistics describe the source MIL
+/// graph rather than Apple's optimized executable: the histogram counts every
+/// non-`const` source operation under the function's opset, `storagePrecision`
+/// lists the data types read from external weight files and `computePrecision`
+/// the numeric types of operation outputs.
 pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     let description = ModelDescription::decode(&program.description_data);
     let multifunction = !description.functions.is_empty() || program.description_data.is_empty();
@@ -224,21 +230,12 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         .unwrap_or_else(|| "main".to_string());
     let main_description = description.function(&main_name);
 
-    let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    if let Some((_, f)) = main_func {
-        let prefix = opset_prefix(&f.opset);
-        for op in f.block.all_operations() {
-            *hist.entry(format!("{prefix}.{}", op.r#type)).or_insert(0) += 1;
-        }
-    }
+    let hist = main_func
+        .map(|(_, f)| operation_histogram(f))
+        .unwrap_or_default();
 
-    let inputs: Vec<(String, MILType)> = main_func
-        .map(|(_, f)| {
-            f.inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.r#type.clone()))
-                .collect()
-        })
+    let (states, inputs): (NamedTypes, NamedTypes) = main_func
+        .map(|(_, f)| split_state_inputs(&f.inputs, main_description))
         .unwrap_or_default();
 
     let output_types: Vec<(String, MILType)> = main_func
@@ -251,27 +248,30 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         })
         .unwrap_or_default();
 
-    // Dominant storage/compute precision (matches `coremlc` shape).
-    let mut counts: std::collections::HashMap<MILDataType, usize> =
-        std::collections::HashMap::new();
+    let mut compute = BTreeSet::new();
+    let mut storage = BTreeSet::new();
     if let Some((_, f)) = main_func {
         for op in f.block.all_operations() {
-            for o in &op.outputs {
-                *counts.entry(o.r#type.data_type).or_insert(0) += 1;
-            }
+            compute.extend(
+                op.outputs
+                    .iter()
+                    .filter_map(|output| numeric_precision(output.r#type.data_type)),
+            );
+            storage.extend(
+                blob_values(op).map(|value| format_data_type_for_meta(value.r#type.data_type)),
+            );
         }
     }
-    let dominant = counts
-        .iter()
-        .max_by_key(|(dtype, count)| (**count, std::cmp::Reverse(**dtype as u64)))
-        .map(|(k, _)| *k)
-        .unwrap_or(MILDataType::Float32);
-    let precision = format_data_type_for_meta(dominant);
+    let precision = precision_text(&compute).unwrap_or_else(|| "Float32".into());
     let avail = availability_for_spec(program.spec_version);
 
     let mut json = String::new();
     json.push_str("[\n  {\n");
     json.push_str("    \"metadataOutputVersion\" : \"3.0\",\n");
+    // Present only for models reading constants from external weight files.
+    if let Some(storage) = precision_text(&storage) {
+        json.push_str(&format!("    \"storagePrecision\" : \"{storage}\",\n"));
+    }
     json.push_str(&format!(
         "    \"outputSchema\" : {},\n",
         schema_list(
@@ -295,11 +295,8 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         json.push_str("    \"functions\" : [\n");
         for (index, (function_name, function)) in program.functions.iter().enumerate() {
             let function_description = description.function(function_name);
-            let function_inputs: Vec<_> = function
-                .inputs
-                .iter()
-                .map(|input| (input.name.clone(), input.r#type.clone()))
-                .collect();
+            let (function_states, function_inputs) =
+                split_state_inputs(&function.inputs, function_description);
             let function_outputs: Vec<_> = function
                 .block
                 .outputs
@@ -318,18 +315,20 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
                     "        "
                 )
             ));
-            json.push_str("        \"stateSchema\" : [\n\n        ],\n");
+            json.push_str(&format!(
+                "        \"stateSchema\" : {},\n",
+                state_schema_list(
+                    &function_states,
+                    function_description.map(|d| d.states.as_slice()),
+                    "        "
+                )
+            ));
             json.push_str(&format!(
                 "        \"name\" : {},\n",
                 json_string(function_name)
             ));
             json.push_str("        \"mlProgramOperationTypeHistogram\" : {\n");
-            let mut function_hist = std::collections::BTreeMap::<String, usize>::new();
-            for op in function.block.all_operations() {
-                *function_hist
-                    .entry(format!("{}.{}", opset_prefix(&function.opset), op.r#type))
-                    .or_default() += 1;
-            }
+            let function_hist = operation_histogram(function);
             for (i, (k, v)) in function_hist.iter().enumerate() {
                 json.push_str(&format!("          \"{k}\" : {v}"));
                 if i < function_hist.len() - 1 {
@@ -367,7 +366,14 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.push_str("    },\n");
 
     json.push_str("    \"isUpdatable\" : \"0\",\n");
-    json.push_str("    \"stateSchema\" : [\n\n    ],\n");
+    json.push_str(&format!(
+        "    \"stateSchema\" : {},\n",
+        state_schema_list(
+            &states,
+            main_description.map(|d| d.states.as_slice()),
+            "    "
+        )
+    ));
 
     json.push_str("    \"availability\" : {\n");
     for (i, (k, v)) in avail.iter().enumerate() {
@@ -422,10 +428,128 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.into_bytes()
 }
 
+type NamedTypes = Vec<(String, MILType)>;
+
+/// Separate `state<...>` function inputs (reported under `stateSchema`) from
+/// ordinary inputs (`inputSchema`). Both lists follow the order of the source
+/// description, as `coremlc` reports them; names the description does not
+/// list keep their function order after the listed ones.
+fn split_state_inputs(
+    inputs: &[MILNamedType],
+    description: Option<&FunctionDescription>,
+) -> (NamedTypes, NamedTypes) {
+    let (mut states, mut tensors): (NamedTypes, NamedTypes) = inputs
+        .iter()
+        .map(|input| (input.name.clone(), input.r#type.clone()))
+        .partition(|(_, ty)| ty.state);
+    if let Some(description) = description {
+        for (entries, features) in [
+            (&mut states, &description.states),
+            (&mut tensors, &description.inputs),
+        ] {
+            entries.sort_by_key(|(name, _)| {
+                features
+                    .iter()
+                    .position(|feature| &feature.name == name)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
+    (states, tensors)
+}
+
+/// Count the source operations of `function` under `coremlc`'s histogram keys.
+/// `const` declarations are not operations in that histogram.
+pub(crate) fn operation_histogram(function: &MILFunction) -> BTreeMap<String, usize> {
+    let mut histogram = BTreeMap::new();
+    for op in function.block.all_operations() {
+        if op.r#type != "const" {
+            *histogram
+                .entry(histogram_key(&function.opset, &op.r#type))
+                .or_default() += 1;
+        }
+    }
+    histogram
+}
+
+/// `Ios18.constexprBlockwiseShiftScale` for `constexpr_blockwise_shift_scale`
+/// in a CoreML8 function: the opset prefix and the operation in camel case.
+pub(crate) fn histogram_key(opset: &str, op_type: &str) -> String {
+    let mut key = format!("{}.", opset_prefix(opset));
+    let mut upper = false;
+    for ch in op_type.chars() {
+        if ch == '_' {
+            upper = true;
+        } else if upper {
+            key.extend(ch.to_uppercase());
+            upper = false;
+        } else {
+            key.push(ch);
+        }
+    }
+    key
+}
+
+/// Attribute and immediate-argument values of `op` stored in a weight file.
+pub(crate) fn blob_values(op: &MILOperation) -> impl Iterator<Item = &MILValue> {
+    let arguments = op
+        .inputs
+        .iter()
+        .flat_map(|(_, bindings)| bindings)
+        .filter_map(|binding| match binding {
+            MILBinding::Immediate(value) => Some(value),
+            MILBinding::Reference(_) => None,
+        });
+    op.attributes
+        .iter()
+        .map(|(_, value)| value)
+        .chain(arguments)
+        .filter(|value| value.blob.is_some())
+}
+
+/// `Float16`, `Mixed (Float16, UInt8)`, or `None` for an empty set.
+pub(crate) fn precision_text(precisions: &BTreeSet<&'static str>) -> Option<String> {
+    match precisions.len() {
+        0 => None,
+        1 => precisions.first().map(|name| (*name).to_owned()),
+        _ => Some(format!(
+            "Mixed ({})",
+            precisions.iter().copied().collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// Data types counted in `computePrecision`; booleans and strings are not.
+pub(crate) fn numeric_precision(dtype: MILDataType) -> Option<&'static str> {
+    match dtype {
+        MILDataType::Bool | MILDataType::String => None,
+        dtype => Some(format_data_type_for_meta(dtype)),
+    }
+}
+
 pub(crate) fn schema_list(
     entries: &[(String, MILType)],
     features: Option<&[FeatureDescription]>,
     indent: &str,
+) -> String {
+    schema_list_of_kind(entries, features, indent, false)
+}
+
+/// `stateSchema` entries: like `schema_list`, but typed `State` and without the
+/// shape-flexibility fields (state shapes are fixed), matching `coremlc`.
+fn state_schema_list(
+    entries: &[(String, MILType)],
+    features: Option<&[FeatureDescription]>,
+    indent: &str,
+) -> String {
+    schema_list_of_kind(entries, features, indent, true)
+}
+
+fn schema_list_of_kind(
+    entries: &[(String, MILType)],
+    features: Option<&[FeatureDescription]>,
+    indent: &str,
+    state: bool,
 ) -> String {
     if entries.is_empty() {
         return format!("[\n\n{indent}]");
@@ -434,7 +558,12 @@ pub(crate) fn schema_list(
     for (i, (name, ty)) in entries.iter().enumerate() {
         let feature =
             features.and_then(|features| features.iter().find(|feature| &feature.name == name));
-        s.push_str(&schema_entry(name, ty, feature, &format!("{indent}  ")));
+        let entry = if state {
+            state_schema_entry(name, ty, feature, &format!("{indent}  "))
+        } else {
+            schema_entry(name, ty, feature, &format!("{indent}  "))
+        };
+        s.push_str(&entry);
         if i < entries.len() - 1 {
             s.push(',');
         }
@@ -442,6 +571,45 @@ pub(crate) fn schema_list(
     }
     s.push_str(indent);
     s.push(']');
+    s
+}
+
+fn state_schema_entry(
+    name: &str,
+    r#type: &MILType,
+    feature: Option<&FeatureDescription>,
+    indent: &str,
+) -> String {
+    let dt_str = match feature.map(|f| f.data_type) {
+        Some(65568) => "Float32",
+        Some(65552) => "Float16",
+        _ => format_data_type_for_meta(r#type.data_type),
+    };
+    let dimensions: Vec<String> = feature
+        .filter(|f| !f.shape.is_empty())
+        .map(|f| f.shape.iter().map(ToString::to_string).collect())
+        .unwrap_or_else(|| r#type.shape.iter().map(ToString::to_string).collect());
+    let mut s = format!("{indent}{{\n");
+    s.push_str(&format!("{indent}  \"dataType\" : \"{dt_str}\",\n"));
+    s.push_str(&format!(
+        "{indent}  \"isOptional\" : \"{}\",\n",
+        u8::from(feature.is_some_and(|f| f.optional))
+    ));
+    s.push_str(&format!(
+        "{indent}  \"formattedType\" : \"State ({dt_str} {})\",\n",
+        dimensions.join(" \u{00d7} ")
+    ));
+    s.push_str(&format!(
+        "{indent}  \"shortDescription\" : {},\n",
+        json_string(feature.map(|f| f.short_description.as_str()).unwrap_or(""))
+    ));
+    s.push_str(&format!(
+        "{indent}  \"shape\" : \"[{}]\",\n",
+        dimensions.join(", ")
+    ));
+    s.push_str(&format!("{indent}  \"name\" : {},\n", json_string(name)));
+    s.push_str(&format!("{indent}  \"type\" : \"State\"\n"));
+    s.push_str(&format!("{indent}}}"));
     s
 }
 
@@ -563,11 +731,15 @@ pub(crate) fn format_data_type_for_meta(dt: MILDataType) -> &'static str {
     match dt {
         MILDataType::Float32 => "Float32",
         MILDataType::Float16 => "Float16",
+        MILDataType::Float64 => "Double",
+        MILDataType::Int8 => "Int8",
+        MILDataType::Int16 => "Int16",
         MILDataType::Int32 => "Int32",
         MILDataType::Int64 => "Int64",
+        MILDataType::Uint8 => "UInt8",
+        MILDataType::Uint16 => "UInt16",
         MILDataType::Bool => "Bool",
         MILDataType::String => "String",
-        _ => dt.text_name(),
     }
 }
 
@@ -628,7 +800,8 @@ fn encode_function_description(name: &str, function: &MILFunction) -> Vec<u8> {
     append_proto_string(&mut bin, 1, name);
     for input in &function.inputs {
         let desc = encode_feature_description(&input.name, &input.r#type);
-        append_proto_length_delimited(&mut bin, 2, &desc);
+        // FunctionDescription.input = 2, FunctionDescription.state = 6.
+        append_proto_length_delimited(&mut bin, if input.r#type.state { 6 } else { 2 }, &desc);
     }
     for output_name in &function.block.outputs {
         let ty = find_output_type(output_name, &function.block);
@@ -645,15 +818,23 @@ fn encode_feature_description(name: &str, ty: &MILType) -> Vec<u8> {
         &ty.concrete_shape()
             .expect("a synthesized feature description needs a concrete shape"),
         ty.data_type,
+        ty.state,
     );
     append_proto_length_delimited(&mut bin, 3, &feature_type);
     bin
 }
 
-fn encode_feature_type(shape: &[usize], dt: MILDataType) -> Vec<u8> {
+fn encode_feature_type(shape: &[usize], dt: MILDataType, state: bool) -> Vec<u8> {
     let mut bin = Vec::new();
     let arr = encode_array_feature_type(shape, dt);
-    append_proto_length_delimited(&mut bin, 5, &arr);
+    if state {
+        // FeatureType.stateType = 8 { StateFeatureType.arrayType = 1 }
+        let mut state_type = Vec::new();
+        append_proto_length_delimited(&mut state_type, 1, &arr);
+        append_proto_length_delimited(&mut bin, 8, &state_type);
+    } else {
+        append_proto_length_delimited(&mut bin, 5, &arr);
+    }
     bin
 }
 
@@ -716,4 +897,274 @@ fn append_u32_le(bin: &mut Vec<u8>, value: u32) {
 
 fn append_u64_le(bin: &mut Vec<u8>, value: u64) {
     bin.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(name: &str, r#type: MILType) -> MILNamedType {
+        MILNamedType {
+            name: name.into(),
+            r#type,
+        }
+    }
+
+    fn fp16() -> MILType {
+        MILType::new(MILDataType::Float16, vec![1, 4])
+    }
+
+    fn operation(kind: &str, output: Option<MILDataType>) -> MILOperation {
+        MILOperation {
+            r#type: kind.into(),
+            blocks: Vec::new(),
+            inputs: Vec::new(),
+            outputs: output
+                .map(|data_type| named("value", MILType::new(data_type, vec![2])))
+                .into_iter()
+                .collect(),
+            attributes: Vec::new(),
+        }
+    }
+
+    fn function(opset: &str, operations: Vec<MILOperation>) -> MILFunction {
+        MILFunction {
+            inputs: Vec::new(),
+            opset: opset.into(),
+            block: MILBlock {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                operations,
+            },
+        }
+    }
+
+    fn feature(name: &str, data_type: u64, shape: &[i64]) -> FeatureDescription {
+        FeatureDescription {
+            name: name.into(),
+            data_type,
+            shape: shape.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn names(entries: &NamedTypes) -> Vec<&str> {
+        entries.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    #[test]
+    fn histogram_keys_use_the_opset_prefix_and_camel_case() {
+        for (opset, operation, key) in [
+            (
+                "CoreML8",
+                "constexpr_blockwise_shift_scale",
+                "Ios18.constexprBlockwiseShiftScale",
+            ),
+            ("CoreML8", "read_state", "Ios18.readState"),
+            ("CoreML8", "write_state", "Ios18.writeState"),
+            ("CoreML7", "reduce_l2_norm", "Ios17.reduceL2Norm"),
+            ("CoreML6", "add", "Ios16.add"),
+            ("CoreML5", "matmul", "Ios15.matmul"),
+            ("CoreML9", "trailing_", "Generic.trailing"),
+        ] {
+            assert_eq!(histogram_key(opset, operation), key);
+        }
+    }
+
+    #[test]
+    fn histogram_counts_nested_operations_but_no_constants() {
+        let mut branch = operation("cond", Some(MILDataType::Float32));
+        branch.blocks.push(MILBlock {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            operations: vec![
+                operation("const", Some(MILDataType::Int32)),
+                operation("write_state", None),
+            ],
+        });
+        let function = function(
+            "CoreML8",
+            vec![
+                operation("const", Some(MILDataType::Float16)),
+                operation("write_state", None),
+                branch,
+            ],
+        );
+        assert_eq!(
+            operation_histogram(&function),
+            BTreeMap::from([("Ios18.cond".into(), 1), ("Ios18.writeState".into(), 2)])
+        );
+        assert!(operation_histogram(&self::function("CoreML8", Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn precision_text_names_one_type_or_a_sorted_mixture() {
+        assert_eq!(precision_text(&BTreeSet::new()), None);
+        assert_eq!(
+            precision_text(&BTreeSet::from(["Float16"])).as_deref(),
+            Some("Float16")
+        );
+        assert_eq!(
+            precision_text(&BTreeSet::from(["UInt8", "Float32", "Float16"])).as_deref(),
+            Some("Mixed (Float16, Float32, UInt8)")
+        );
+        assert_eq!(numeric_precision(MILDataType::Bool), None);
+        assert_eq!(numeric_precision(MILDataType::String), None);
+        for (data_type, name) in [
+            (MILDataType::Float16, "Float16"),
+            (MILDataType::Float32, "Float32"),
+            (MILDataType::Float64, "Double"),
+            (MILDataType::Int8, "Int8"),
+            (MILDataType::Int16, "Int16"),
+            (MILDataType::Int32, "Int32"),
+            (MILDataType::Int64, "Int64"),
+            (MILDataType::Uint8, "UInt8"),
+            (MILDataType::Uint16, "UInt16"),
+        ] {
+            assert_eq!(numeric_precision(data_type), Some(name));
+        }
+        assert_eq!(format_data_type_for_meta(MILDataType::Bool), "Bool");
+        assert_eq!(format_data_type_for_meta(MILDataType::String), "String");
+    }
+
+    #[test]
+    fn blob_values_cover_attributes_and_immediate_arguments_only() {
+        let value = |data_type, blob: bool| MILValue {
+            r#type: MILType::new(data_type, vec![2]),
+            tensor: MILTensorData::default(),
+            blob: blob.then(|| MILBlobRef {
+                filename: "@model_path/weights/weights.bin".into(),
+                offset: 64,
+            }),
+        };
+        let mut op = operation("example", None);
+        op.attributes = vec![
+            ("stored".into(), value(MILDataType::Int8, true)),
+            ("inline".into(), value(MILDataType::Int16, false)),
+        ];
+        op.inputs = vec![(
+            "x".into(),
+            vec![
+                MILBinding::Reference("stored".into()),
+                MILBinding::Immediate(value(MILDataType::Float16, true)),
+                MILBinding::Immediate(value(MILDataType::Float32, false)),
+            ],
+        )];
+        let stored: Vec<_> = blob_values(&op)
+            .map(|value| value.r#type.data_type)
+            .collect();
+        assert_eq!(stored, [MILDataType::Int8, MILDataType::Float16]);
+    }
+
+    #[test]
+    fn schemas_follow_the_description_order_and_split_off_states() {
+        let inputs = [
+            named("s1", fp16().into_state()),
+            named("q", fp16()),
+            named("extra", fp16()),
+            named("s0", fp16().into_state()),
+            named("p", fp16()),
+        ];
+        // Without a description the function order is kept.
+        let (states, tensors) = split_state_inputs(&inputs, None);
+        assert_eq!(names(&states), ["s1", "s0"]);
+        assert_eq!(names(&tensors), ["q", "extra", "p"]);
+        assert!(states.iter().all(|(_, ty)| ty.state));
+        assert!(tensors.iter().all(|(_, ty)| !ty.state));
+        // Listed names come first, in description order; the rest keep theirs.
+        let description = FunctionDescription {
+            name: "main".into(),
+            inputs: vec![feature("p", 65552, &[1, 4]), feature("q", 65552, &[1, 4])],
+            outputs: Vec::new(),
+            states: vec![feature("s0", 65552, &[1, 4]), feature("s1", 65552, &[1, 4])],
+        };
+        let (states, tensors) = split_state_inputs(&inputs, Some(&description));
+        assert_eq!(names(&states), ["s0", "s1"]);
+        assert_eq!(names(&tensors), ["p", "q", "extra"]);
+        // An empty (synthesized) description changes nothing.
+        let (states, tensors) = split_state_inputs(&inputs, Some(&FunctionDescription::default()));
+        assert_eq!(names(&states), ["s1", "s0"]);
+        assert_eq!(names(&tensors), ["q", "extra", "p"]);
+        let (states, tensors) = split_state_inputs(&[], None);
+        assert!(states.is_empty());
+        assert!(tensors.is_empty());
+    }
+
+    #[test]
+    fn state_schema_entries_prefer_the_description_over_the_mil_type() {
+        let entry = |ty: &MILType, feature: Option<&FeatureDescription>| {
+            let json = state_schema_entry("state_0", ty, feature, "");
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        };
+        let from_type = entry(&fp16().into_state(), None);
+        assert_eq!(
+            from_type,
+            serde_json::json!({
+                "dataType": "Float16",
+                "isOptional": "0",
+                "formattedType": "State (Float16 1 \u{d7} 4)",
+                "shortDescription": "",
+                "shape": "[1, 4]",
+                "name": "state_0",
+                "type": "State"
+            })
+        );
+        assert!(from_type.get("hasShapeFlexibility").is_none());
+        // The description's array type wins over the MIL type.
+        let mut described = feature("state_0", 65568, &[2, 3]);
+        described.optional = true;
+        described.short_description = "carried \"value\"".into();
+        let from_description = entry(&fp16().into_state(), Some(&described));
+        assert_eq!(from_description["dataType"], "Float32");
+        assert_eq!(
+            from_description["formattedType"],
+            "State (Float32 2 \u{d7} 3)"
+        );
+        assert_eq!(from_description["shape"], "[2, 3]");
+        assert_eq!(from_description["isOptional"], "1");
+        assert_eq!(from_description["shortDescription"], "carried \"value\"");
+        let half = entry(&fp16().into_state(), Some(&feature("state_0", 65552, &[4])));
+        assert_eq!(half["formattedType"], "State (Float16 4)");
+        // A state feature without an array type falls back to the MIL type.
+        let int8 = MILType::new(MILDataType::Int8, vec![3]).into_state();
+        let fallback = entry(&int8, Some(&feature("state_0", 0, &[])));
+        assert_eq!(fallback["dataType"], "Int8");
+        assert_eq!(fallback["formattedType"], "State (Int8 3)");
+        assert_eq!(fallback["shape"], "[3]");
+    }
+
+    #[test]
+    fn schema_lists_separate_state_and_array_entries() {
+        let entries = vec![
+            ("a".to_owned(), fp16().into_state()),
+            ("b".to_owned(), fp16().into_state()),
+        ];
+        let features = [feature("b", 65552, &[1, 4])];
+        let states: serde_json::Value =
+            serde_json::from_str(&state_schema_list(&entries, Some(&features), "  ")).unwrap();
+        let arrays: serde_json::Value =
+            serde_json::from_str(&schema_list(&entries, Some(&features), "  ")).unwrap();
+        for index in 0..2 {
+            assert_eq!(states[index]["type"], "State");
+            assert!(states[index].get("hasShapeFlexibility").is_none());
+            assert_eq!(arrays[index]["type"], "MultiArray");
+            assert_eq!(arrays[index]["hasShapeFlexibility"], "0");
+        }
+        assert_eq!(state_schema_list(&[], None, "  "), "[\n\n  ]");
+        assert_eq!(schema_list(&[], None, "  "), "[\n\n  ]");
+    }
+
+    #[test]
+    fn synthesized_feature_types_wrap_state_arrays() {
+        let array = encode_array_feature_type(&[1, 4], MILDataType::Float16);
+        assert_eq!(array, [10, 2, 1, 4, 16, 0x90, 0x80, 4]);
+        // FeatureType.multiArrayType = 5.
+        let tensor = encode_feature_type(&[1, 4], MILDataType::Float16, false);
+        assert_eq!(tensor, [&[0x2a, 8][..], &array].concat());
+        // FeatureType.stateType = 8 { StateFeatureType.arrayType = 1 }.
+        let state = encode_feature_type(&[1, 4], MILDataType::Float16, true);
+        assert_eq!(state, [&[0x42, 10, 0x0a, 8][..], &array].concat());
+        let described = encode_feature_description("s", &fp16().into_state());
+        assert_eq!(described, [&[0x0a, 1, b's', 0x1a, 12][..], &state].concat());
+    }
 }
