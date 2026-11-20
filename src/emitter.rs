@@ -23,19 +23,28 @@ use crate::sink::MILOutputSink;
 use crate::types::*;
 use std::collections::HashMap;
 
-/// Per-function emission state.
-struct Scope<'a> {
+/// Emission state for one lexical block.
+///
+/// MIL blocks are lexically scoped: a nested block sees its enclosing blocks'
+/// values unless it rebinds the name, and sibling blocks never see each
+/// other's values. `constexpr_*` arguments are resolved through this chain so
+/// that a `const` inlines the value visible where it is referenced.
+struct Scope<'s, 'a> {
     /// Pipeline children borrow assets from the bundle root.
     shared_root: bool,
-    /// `const` values by output name, collected only when a `constexpr_*` op
-    /// refers to a value by name.
-    consts: HashMap<&'a str, &'a MILValue>,
+    /// Whether any `constexpr_*` op in the function refers to a value by name.
+    /// When it is unset no constant tables are built.
+    inline_consts: bool,
+    /// Names bound directly in this block: `Some` for a `const` with a value,
+    /// `None` for anything else (block inputs, other op outputs), which hides
+    /// a `const` of the same name in an enclosing block.
+    consts: HashMap<&'a str, Option<&'a MILValue>>,
+    parent: Option<&'s Scope<'s, 'a>>,
 }
 
-impl<'a> Scope<'a> {
+impl<'s, 'a> Scope<'s, 'a> {
     fn new(function: &'a MILFunction, shared_root: bool) -> Self {
-        let mut consts = HashMap::new();
-        let needed = function.block.all_operations().any(|op| {
+        let inline_consts = function.block.all_operations().any(|op| {
             is_constexpr(op)
                 && op
                     .inputs
@@ -43,22 +52,52 @@ impl<'a> Scope<'a> {
                     .flat_map(|(_, bindings)| bindings)
                     .any(|binding| matches!(binding, MILBinding::Reference(_)))
         });
-        if needed {
-            for op in function.block.all_operations() {
-                if op.r#type != "const" {
-                    continue;
-                }
-                let value = op.attributes.iter().find(|(key, _)| key == "val");
-                if let (Some(output), Some((_, value))) = (op.outputs.first(), value) {
-                    consts.insert(output.name.as_str(), value);
-                }
-            }
-        }
         Self {
             shared_root,
-            consts,
+            inline_consts,
+            consts: block_bindings(&function.block, inline_consts),
+            parent: None,
         }
     }
+
+    /// The scope of a block nested inside an operation of this one.
+    fn child(&'s self, block: &'a MILBlock) -> Self {
+        Self {
+            shared_root: self.shared_root,
+            inline_consts: self.inline_consts,
+            consts: block_bindings(block, self.inline_consts),
+            parent: Some(self),
+        }
+    }
+
+    /// The `const` value `name` refers to here, if it refers to one.
+    fn constant(&self, name: &str) -> Option<&'a MILValue> {
+        match self.consts.get(name) {
+            Some(binding) => *binding,
+            None => self.parent.and_then(|parent| parent.constant(name)),
+        }
+    }
+}
+
+/// Names bound directly in `block` (not in blocks nested inside it).
+fn block_bindings(block: &MILBlock, collect: bool) -> HashMap<&str, Option<&MILValue>> {
+    let mut bindings = HashMap::new();
+    if !collect {
+        return bindings;
+    }
+    for input in &block.inputs {
+        bindings.insert(input.name.as_str(), None);
+    }
+    for op in &block.operations {
+        let value = (op.r#type == "const")
+            .then(|| op.attributes.iter().find(|(key, _)| key == "val"))
+            .flatten()
+            .map(|(_, value)| value);
+        for (index, output) in op.outputs.iter().enumerate() {
+            bindings.insert(output.name.as_str(), value.filter(|_| index == 0));
+        }
+    }
+    bindings
 }
 
 fn is_constexpr(op: &MILOperation) -> bool {
@@ -180,11 +219,16 @@ fn emit_flexible_shapes(description: &FunctionDescription, out: &mut MILOutputSi
     ));
 }
 
-fn emit_operation(op: &MILOperation, out: &mut MILOutputSink, scope: &Scope) {
+fn emit_operation<'a>(op: &'a MILOperation, out: &mut MILOutputSink, scope: &Scope<'_, 'a>) {
     emit_operation_at(op, out, scope, 12);
 }
 
-fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, scope: &Scope, depth: usize) {
+fn emit_operation_at<'a>(
+    op: &'a MILOperation,
+    out: &mut MILOutputSink,
+    scope: &Scope<'_, 'a>,
+    depth: usize,
+) {
     let padding = " ".repeat(depth);
     let indent = padding.as_str();
     let shared_root = scope.shared_root;
@@ -263,8 +307,9 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, scope: &Scope, 
             ));
         }
         out.write_str(") {\n");
+        let block_scope = scope.child(block);
         for child in &block.operations {
-            emit_operation_at(child, out, scope, depth + 8);
+            emit_operation_at(child, out, &block_scope, depth + 8);
         }
         out.write_str(&format!(
             "{} }} -> ({})",
@@ -321,7 +366,7 @@ fn emit_bindings(bindings: &[MILBinding], out: &mut MILOutputSink, scope: &Scope
 /// arguments as literal values and leaves the `const` op in place.
 fn emit_binding(binding: &MILBinding, out: &mut MILOutputSink, scope: &Scope, inline: bool) {
     match binding {
-        MILBinding::Reference(name) => match scope.consts.get(name.as_str()).filter(|_| inline) {
+        MILBinding::Reference(name) => match scope.constant(name).filter(|_| inline) {
             Some(value) => emit_typed_literal(value, out, scope.shared_root),
             None => out.write_str(name),
         },
@@ -849,6 +894,93 @@ mod tests {
         );
     }
 
+    fn block(operations: Vec<MILOperation>, outputs: &[&str]) -> MILBlock {
+        MILBlock {
+            inputs: Vec::new(),
+            outputs: outputs.iter().map(|&name| name.into()).collect(),
+            operations,
+        }
+    }
+
+    fn dequantize(data: &str, output: &str) -> MILOperation {
+        operation(
+            "constexpr_blockwise_shift_scale",
+            vec![reference("data", data), reference("scale", "scale")],
+            vec![named(output, tensor(MILDataType::Float32, &[1]))],
+        )
+    }
+
+    fn inlined_data(text: &str, output: &str) -> String {
+        let line = text
+            .lines()
+            .find(|line| line.contains(&format!(" {output} = constexpr_")))
+            .unwrap_or_else(|| panic!("no constexpr line for {output} in:\n{text}"));
+        let start = line.find("data = ").unwrap() + "data = ".len();
+        let end = line[start..].find(", scale").unwrap() + start;
+        line[start..end].to_owned()
+    }
+
+    #[test]
+    fn constexpr_literals_resolve_in_their_lexical_block() {
+        let fp32 = tensor(MILDataType::Float32, &[1]);
+        // Sibling `cond` branches each declare `data`, and the true branch
+        // also shadows the outer `scale`, which the false branch captures.
+        let mut cond = operation(
+            "cond",
+            vec![reference("pred", "pred")],
+            vec![named("picked", fp32.clone())],
+        );
+        cond.blocks = vec![
+            block(
+                vec![
+                    constant("data", int8_value(&[1])),
+                    constant("scale", int8_value(&[10])),
+                    dequantize("data", "then_weight"),
+                ],
+                &["then_weight"],
+            ),
+            block(
+                vec![
+                    constant("data", int8_value(&[2])),
+                    dequantize("data", "else_weight"),
+                ],
+                &["else_weight"],
+            ),
+        ];
+        // A loop-carried block input shadows the outer `data` constant, so the
+        // loop body must keep the name rather than inline the outer literal.
+        let mut body_block = block(vec![dequantize("data", "loop_weight")], &["loop_weight"]);
+        body_block.inputs = vec![named("data", tensor(MILDataType::Int8, &[1]))];
+        let mut while_loop = operation(
+            "while_loop",
+            vec![reference("loop_vars", "data")],
+            vec![named("looped", fp32.clone())],
+        );
+        while_loop.blocks = vec![body_block];
+        let program = program(
+            vec![named("pred", MILType::new(MILDataType::Bool, Vec::new()))],
+            vec![
+                constant("data", int8_value(&[3])),
+                constant("scale", int8_value(&[30])),
+                cond,
+                while_loop,
+                // After the branches close, the function-level `data` applies again.
+                dequantize("data", "y"),
+            ],
+        );
+        let text = emit_to_string(&program);
+        assert_eq!(inlined_data(&text, "then_weight"), "tensor<int8, [1]>([1])");
+        assert_eq!(inlined_data(&text, "else_weight"), "tensor<int8, [1]>([2])");
+        assert_eq!(inlined_data(&text, "loop_weight"), "data");
+        assert_eq!(inlined_data(&text, "y"), "tensor<int8, [1]>([3])");
+        assert!(text.contains(
+            "then_weight = constexpr_blockwise_shift_scale(data = tensor<int8, [1]>([1]), scale = tensor<int8, [1]>([10]));"
+        ));
+        assert!(text.contains(
+            "else_weight = constexpr_blockwise_shift_scale(data = tensor<int8, [1]>([2]), scale = tensor<int8, [1]>([30]));"
+        ));
+    }
+
     #[test]
     fn constexpr_operations_with_immediate_arguments_need_no_constant_table() {
         let fp32 = tensor(MILDataType::Float32, &[3]);
@@ -870,14 +1002,19 @@ mod tests {
                 operations: vec![constant("data", int8_value(&[4])), legacy],
             },
         };
-        assert!(Scope::new(&function, false).consts.is_empty());
+        let scope = Scope::new(&function, false);
+        assert!(!scope.inline_consts && scope.consts.is_empty());
         let mut with_reference = function.clone();
         with_reference.block.operations[1]
             .inputs
             .push(reference("other", "data"));
         let scope = Scope::new(&with_reference, true);
         assert!(scope.shared_root);
-        assert_eq!(scope.consts.keys().copied().collect::<Vec<_>>(), ["data"]);
+        assert!(matches!(
+            scope.constant("data").map(|value| &value.tensor),
+            Some(MILTensorData::Ints(values)) if values == &[4]
+        ));
+        assert!(scope.constant("y").is_none());
     }
 
     #[test]
