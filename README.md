@@ -224,7 +224,9 @@ fixtures: uint8 data with a uint8 offset and FP16 scales per 32-column block
 read from `weights.bin`, and int8 data with FP32 unit and per-row scales and no
 offset. `data`, `scale` and `offset` are `const` operations referenced by name;
 as in `coremlc` output, a `constexpr_*` operation prints those constants as
-literal values. On macOS 15+, check accumulation across predictions, a second
+literal values. The name resolves in the operation's own block, then in the
+blocks enclosing it, so sibling `cond` or `while_loop` bodies may each declare
+a constant of the same name. On macOS 15+, check accumulation across predictions, a second
 state starting from zeros, and the dequantized weights with:
 
 ```sh
